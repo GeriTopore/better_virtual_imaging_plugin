@@ -89,3 +89,16 @@ def bvm(braggvectors) -> np.ndarray:
     so it lines up with the diffraction patterns.
     """
     return np.asarray(braggvectors.histogram(mode="raw").data)
+
+
+def peaks_at(braggvectors, positions) -> np.ndarray:
+    """
+    The raw (qx, qy) of every Bragg peak detected at the given scan
+    positions, as an (N, 2) array.
+    """
+    peaks = [braggvectors.raw[rx, ry] for rx, ry in positions]
+    if not peaks:
+        return np.zeros((0, 2))
+    return np.column_stack(
+        [np.concatenate([p.qx for p in peaks]), np.concatenate([p.qy for p in peaks])]
+    )

@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 from py4D_browser.utils import DetectorMode, DetectorShape
 
 from . import bragg, imaging
+from .lattice import GVectorArray
 from .preview_pane import BVMPane, MergedPane, PreviewPane
 
 from typing import TYPE_CHECKING
@@ -150,6 +151,7 @@ class BetterVirtualImagingWindow(QDialog):
         # The left column: the controls, and below them the Bragg vector map
         # if there are Bragg vectors saved with the dataset.
         self.bvm_pane = None
+        self.braggvectors = None  # kept for snapping g-vector arrays to peaks
         self.left_layout = QVBoxLayout()
         self.left_layout.setContentsMargins(0, 0, 0, 0)
         self.left_layout.addWidget(self.controls_scroll)
@@ -225,10 +227,10 @@ class BetterVirtualImagingWindow(QDialog):
             Q_Nx, Q_Ny = self.data_shape[2:]
             self.radius_spin.setRange(0.5, max(Q_Nx, Q_Ny))
             self.radius_spin.setValue(max(1, round(min(Q_Nx, Q_Ny) / 40)))
+        self.radius_spin.valueChanged.connect(self._update_array_radii)
 
-        # Locks new apertures to the bright-field disk radius, measured from
-        # the mean diffraction pattern the first time it's checked.
-        self.bf_radius = None
+        # Locks new apertures to the bright-field disk radius.
+        self.bf_disk = None  # (radius, qx0, qy0), measured when first needed
         self.use_bf_radius_checkbox = QCheckBox("Use BF radius")
         self.use_bf_radius_checkbox.setToolTip(
             "Size new apertures to the bright-field disk, as measured from the "
@@ -297,6 +299,8 @@ class BetterVirtualImagingWindow(QDialog):
         pane.sig_apertures_changed.connect(partial(self.update_vis, panes=[pane]))
         pane.sig_dp_clicked.connect(partial(self.on_dp_clicked, pane))
         pane.sig_remove_requested.connect(partial(self.remove_pane, pane))
+        pane.sig_array_toggled.connect(partial(self.on_array_toggled, pane))
+        pane.set_snap_available(self.braggvectors is not None)
         pane.set_click_to_add(self.add_on_click_button.isChecked())
         self.panes.append(pane)
         self._layout_panes()
@@ -510,33 +514,85 @@ class BetterVirtualImagingWindow(QDialog):
     def aperture_radius(self):
         # The spinbox only shows the measured radius rounded, so use it as is.
         if self.use_bf_radius_checkbox.isChecked():
-            return self.bf_radius
+            return self.bf_disk[0]
         return self.radius_spin.value()
 
     def on_use_bf_radius_toggled(self, checked):
-        if checked and self.bf_radius is None:
-            self.bf_radius = self._measure_bf_radius()
-            if self.bf_radius is None:
-                # Leave the radius under the user's control.
-                self.use_bf_radius_checkbox.setChecked(False)
-                return
+        if checked and self._measure_bf_disk() is None:
+            # Leave the radius under the user's control.
+            self.use_bf_radius_checkbox.setChecked(False)
+            return
         if checked:
-            self.radius_spin.setValue(self.bf_radius)
+            self.radius_spin.setValue(self.bf_disk[0])
         self.radius_spin.setEnabled(not checked)
+        self._update_array_radii()
 
-    def _measure_bf_radius(self):
-        if not self._has_data():
-            return None
+    def _measure_bf_disk(self):
+        # Measured once, from the mean pattern; None if that fails.
+        if self.bf_disk is not None or not self._has_data():
+            return self.bf_disk
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            return imaging.measure_bf_radius(self.parent.datacube.data)
+            self.bf_disk = imaging.measure_bf_disk(self.parent.datacube.data)
         except Exception as exc:
             self.parent.statusBar().showMessage(
-                f"Couldn't measure the BF disk radius: {exc}", 5_000
+                f"Couldn't measure the BF disk: {exc}", 5_000
             )
-            return None
         finally:
             QApplication.restoreOverrideCursor()
+        return self.bf_disk
+
+    # --- g-vector arrays ---
+
+    def on_array_toggled(self, pane, checked):
+        if checked and pane.g_array is None and self._has_data():
+            # Start at the BF disk's centre (the pattern's, failing that),
+            # with g-vectors along qx and qy for the user to drag into place.
+            Q_Nx, Q_Ny = self.data_shape[2:]
+            bf_disk = self._measure_bf_disk()
+            origin = bf_disk[1:] if bf_disk is not None else (Q_Nx / 2, Q_Ny / 2)
+            length = round(min(Q_Nx, Q_Ny) / 6)
+            pane.attach_array(
+                GVectorArray(
+                    pane.dp_view.getView(),
+                    (Q_Nx, Q_Ny),
+                    origin,
+                    g1=(length, 0),
+                    g2=(0, length),
+                    radius=self.aperture_radius(),
+                    peaks_fn=partial(self._bragg_peaks, pane),
+                )
+            )
+            pane.set_snap_available(self.braggvectors is not None)
+            # Start on the pattern's peaks, if snapping's on (and possible).
+            if pane.g_array.snap:
+                pane.g_array.snap_all(emit=False)
+        self.update_vis(panes=[pane])
+
+    def _bragg_peaks(self, pane):
+        # The Bragg peaks detected in the pattern a pane shows: at its
+        # cursor's scan position, or at every one in its rectangle.
+        if self.braggvectors is None or not self._has_data():
+            return None
+        selection = pane.get_scan_selection(self.data_shape[:2])
+        if pane.rs_shape is DetectorShape.POINT:
+            positions = [selection]
+        else:
+            slice_x, slice_y = selection
+            positions = [
+                (rx, ry)
+                for rx in range(slice_x.start, slice_x.stop)
+                for ry in range(slice_y.start, slice_y.stop)
+            ]
+        return bragg.peaks_at(self.braggvectors, positions)
+
+    def _update_array_radii(self, *_):
+        # Arrays follow the radius setting (unlike click-added apertures,
+        # which keep the size they were added at).
+        radius = self.aperture_radius()
+        for pane in self.panes:
+            if pane.g_array is not None and pane.g_array.radius != radius:
+                pane.g_array.set_params(radius=radius)
 
     def on_scaling_changed(self, *_):
         # Redisplay each pane's cached pattern with fresh levels for the new
@@ -689,6 +745,10 @@ class BetterVirtualImagingWindow(QDialog):
             return
         finally:
             QApplication.restoreOverrideCursor()
+
+        self.braggvectors = braggvectors
+        for pane in self.panes:
+            pane.set_snap_available(True)
 
         self.bvm_pane = BVMPane(bvm, f"{os.path.basename(filepath)}: {datapath}")
         # Fills the column below the controls, in place of the stretch.

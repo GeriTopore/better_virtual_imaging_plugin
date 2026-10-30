@@ -7,15 +7,20 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QCheckBox,
+    QDoubleSpinBox,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from py4D_browser.utils import DetectorShape, pg_point_roi
+
+from .lattice import G1_PEN, G2_PEN
 
 # The main window's real-space selector pens (see update_realspace_detector
 # in update_views.py), so the cursors look the same here.
@@ -92,6 +97,8 @@ class PreviewPane(QGroupBox):
     sig_dp_clicked = QtCore.pyqtSignal(float, float)
     # The pane's remove button was clicked.
     sig_remove_requested = QtCore.pyqtSignal()
+    # The g-vector array was switched on or off.
+    sig_array_toggled = QtCore.pyqtSignal(bool)
 
     def __init__(self, title):
         super().__init__(title)
@@ -103,6 +110,7 @@ class PreviewPane(QGroupBox):
         self._has_shown_dp = False
         self.vimg = None  # the virtual image from the apertures, once there are any
         self.color = None  # RGB (0-1) chosen for the merged view, if any
+        self.g_array = None  # a GVectorArray, once first switched on
 
         self.dp_view = pg.ImageView()
         self.dp_view.setImage(np.zeros((512, 512)))
@@ -123,6 +131,64 @@ class PreviewPane(QGroupBox):
         self.clear_apertures_button = QPushButton("Clear Apertures")
         self.clear_apertures_button.clicked.connect(self.clear_apertures)
 
+        self.array_button = QPushButton("g-Vector Array")
+        self.array_button.setCheckable(True)
+        self.array_button.setToolTip(
+            "Apertures on the lattice spanned by two g-vectors -- drag O, g1 "
+            "and g2 to fit it to the pattern"
+        )
+        self.array_button.toggled.connect(self._on_array_toggled)
+
+        # Shown while the array is on: for each g-vector, how many steps the
+        # array extends either way along it, and the shift along it (in
+        # multiples of it).
+        self.n1_spin = QSpinBox()
+        self.n2_spin = QSpinBox()
+        for spin in (self.n1_spin, self.n2_spin):
+            spin.setRange(0, 50)
+            spin.setValue(3)
+            spin.setPrefix("\u00b1")
+            spin.valueChanged.connect(self._on_array_params_changed)
+        self.s1_spin = QDoubleSpinBox()
+        self.s2_spin = QDoubleSpinBox()
+        for spin in (self.s1_spin, self.s2_spin):
+            spin.setRange(-1, 1)
+            spin.setSingleStep(0.25)
+            spin.valueChanged.connect(self._on_array_params_changed)
+        self.include_origin_checkbox = QCheckBox("Include origin")
+        self.include_origin_checkbox.toggled.connect(self._on_array_params_changed)
+        # Only offered when there are Bragg vectors (see set_snap_available).
+        self.snap_checkbox = QCheckBox("Snap to Bragg peaks")
+        self.snap_checkbox.setChecked(True)
+        self.snap_checkbox.setToolTip(
+            "Snap O, g1 and g2 onto the nearest Bragg peaks detected in this "
+            "pattern -- all three when ticked, and each when dropped near one"
+        )
+        self.snap_checkbox.toggled.connect(self._on_snap_toggled)
+        self.snap_checkbox.hide()
+
+        def vector_label(text, pen):
+            label = QLabel(text)
+            label.setStyleSheet("color: rgb({}, {}, {});".format(*pen["color"]))
+            return label
+
+        array_layout = QGridLayout()
+        array_layout.setContentsMargins(0, 0, 0, 0)
+        array_layout.setColumnStretch(0, 1)
+        array_layout.addWidget(QLabel("repeats"), 0, 2)
+        array_layout.addWidget(QLabel("shift"), 0, 3)
+        array_layout.addWidget(vector_label("g1", G1_PEN), 1, 1)
+        array_layout.addWidget(self.n1_spin, 1, 2)
+        array_layout.addWidget(self.s1_spin, 1, 3)
+        array_layout.addWidget(self.include_origin_checkbox, 1, 4)
+        array_layout.addWidget(vector_label("g2", G2_PEN), 2, 1)
+        array_layout.addWidget(self.n2_spin, 2, 2)
+        array_layout.addWidget(self.s2_spin, 2, 3)
+        array_layout.addWidget(self.snap_checkbox, 2, 4)
+        self.array_controls = QWidget()
+        self.array_controls.setLayout(array_layout)
+        self.array_controls.hide()
+
         self.remove_button = QToolButton()
         self.remove_button.setText("\u2715")
         self.remove_button.setAutoRaise(True)
@@ -131,6 +197,7 @@ class PreviewPane(QGroupBox):
 
         header = QHBoxLayout()
         header.addStretch()
+        header.addWidget(self.array_button)
         header.addWidget(self.clear_apertures_button)
         header.addWidget(self.remove_button)
 
@@ -145,6 +212,7 @@ class PreviewPane(QGroupBox):
 
         layout = QVBoxLayout()
         layout.addLayout(header)
+        layout.addWidget(self.array_controls)
         layout.addLayout(self.views_layout)
         self.setLayout(layout)
 
@@ -183,6 +251,10 @@ class PreviewPane(QGroupBox):
             return
         qx, qy = pos.y() - 0.5, pos.x() - 0.5
 
+        # Nor is one on an array marker.
+        if self.array_enabled() and self.g_array.marker_at(ev.scenePos()):
+            return
+
         # A click on an existing aperture is the user reaching for it, not
         # asking for a second one on top.
         for (aqx, aqy), radius in self.aperture_geometries():
@@ -214,12 +286,69 @@ class PreviewPane(QGroupBox):
         self.sig_apertures_changed.emit()
 
     def clear_apertures(self):
-        if not self.apertures:
+        # The click-added apertures, and the array (switched off, keeping its
+        # vectors for next time).
+        if not self.apertures and not self.array_enabled():
             return
         for roi in self.apertures:
             self.dp_view.getView().removeItem(roi)
         self.apertures = []
+        self.array_button.blockSignals(True)
+        self.array_button.setChecked(False)
+        self.array_button.blockSignals(False)
+        self._show_array(False)
         self.sig_apertures_changed.emit()
+
+    # --- g-vector array ---
+
+    def attach_array(self, g_array):
+        # Called by the window the first time the array is switched on.
+        self.g_array = g_array
+        g_array.set_params(**self._array_params(), snap=self.snap_checkbox.isChecked())
+        g_array.sig_change_finished.connect(self._on_array_changed)
+        self._show_array(self.array_button.isChecked())
+
+    def _on_array_changed(self):
+        # Changes made while it's off don't change the virtual image.
+        if self.array_enabled():
+            self.sig_apertures_changed.emit()
+
+    def array_enabled(self):
+        return self.g_array is not None and self.array_button.isChecked()
+
+    def _show_array(self, shown):
+        self.array_controls.setVisible(shown)
+        if self.g_array is not None:
+            self.g_array.set_visible(shown)
+
+    def _on_array_toggled(self, checked):
+        self._show_array(checked)
+        self.sig_array_toggled.emit(checked)
+
+    def _array_params(self):
+        return dict(
+            n1=self.n1_spin.value(),
+            n2=self.n2_spin.value(),
+            s1=self.s1_spin.value(),
+            s2=self.s2_spin.value(),
+            include_origin=self.include_origin_checkbox.isChecked(),
+        )
+
+    def _on_array_params_changed(self, *_):
+        if self.g_array is not None:
+            self.g_array.set_params(**self._array_params())
+
+    def _on_snap_toggled(self, checked):
+        if self.g_array is not None:
+            self.g_array.set_params(snap=checked)
+            if checked:
+                self.g_array.snap_all()
+
+    def set_snap_available(self, available):
+        # Snapping needs Bragg vectors saved with the dataset.
+        self.snap_checkbox.setVisible(available)
+        if self.g_array is not None:
+            self.g_array.set_params(snap=available and self.snap_checkbox.isChecked())
 
     @staticmethod
     def _aperture_geometry(roi):
@@ -229,8 +358,14 @@ class PreviewPane(QGroupBox):
         return (qx, qy), radius
 
     def aperture_geometries(self):
-        """Each aperture as ((qx, qy), radius), in data coordinates."""
-        return [self._aperture_geometry(roi) for roi in self.apertures]
+        """
+        Each aperture as ((qx, qy), radius), in data coordinates: the
+        click-added ones, and the array's while it's on.
+        """
+        geometries = [self._aperture_geometry(roi) for roi in self.apertures]
+        if self.array_enabled():
+            geometries += self.g_array.apertures()
+        return geometries
 
     # --- Virtual image and real-space cursor ---
 
@@ -338,6 +473,7 @@ class MergedPane(PreviewPane):
 
         self.clear_apertures_button.hide()
         self.remove_button.hide()
+        self.array_button.hide()
         # The composite has fixed levels, so there's nothing to adjust.
         self.vi_view.ui.histogram.hide()
 

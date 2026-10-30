@@ -62,14 +62,15 @@ def mean_dp(data):
     return total / (R_Nx * R_Ny)
 
 
-def measure_bf_radius(data):
+def measure_bf_disk(data):
     """
-    The bright-field disk radius in pixels, measured from the mean
-    diffraction pattern. Calls py4DSTEM's get_probe_size directly, as the
-    DataCube method writes the result into the datacube's calibration.
+    The bright-field disk's radius and centre, (radius, qx0, qy0) in pixels,
+    measured from the mean diffraction pattern. Calls py4DSTEM's
+    get_probe_size directly, as the DataCube method writes the result into
+    the datacube's calibration.
     """
-    radius, _, _ = get_probe_size(mean_dp(data))
-    return float(radius)
+    radius, qx0, qy0 = get_probe_size(mean_dp(data))
+    return float(radius), float(qx0), float(qy0)
 
 
 def composite_colors(n):
