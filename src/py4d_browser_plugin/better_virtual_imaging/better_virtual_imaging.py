@@ -256,7 +256,7 @@ class BetterVirtualImagingWindow(QDialog):
         self.linear_radio = QRadioButton("Linear")
         self.log_radio = QRadioButton("Log")
         self.power_radio = QRadioButton("Power")
-        self.power_radio.setChecked(True)
+        self.log_radio.setChecked(True)
         for button in (self.linear_radio, self.log_radio, self.power_radio):
             self.scaling_group.addButton(button)
             scaling_layout.addWidget(button)

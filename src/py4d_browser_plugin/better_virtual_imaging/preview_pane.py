@@ -75,7 +75,11 @@ class BVMPane(QGroupBox):
         self.view.setColorMap(diffraction_cmap)
 
     def show_bvm(self, scale_fn, first=False):
-        show_diffraction_image(self.view, self.bvm, scale_fn, True, first)
+        # The map is mostly zeros and tiny values smeared out by its bilinear
+        # binning, which log scaling would stretch over the whole range --
+        # so floor it, for display, at a thousandth of its maximum.
+        floored = np.maximum(self.bvm, 1e-3 * self.bvm.max())
+        show_diffraction_image(self.view, floored, scale_fn, True, first)
 
 
 class PreviewPane(QGroupBox):
