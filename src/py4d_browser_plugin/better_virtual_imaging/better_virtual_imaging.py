@@ -1,3 +1,4 @@
+import os
 from functools import partial
 
 import numpy as np
@@ -15,6 +16,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -22,8 +24,8 @@ from PyQt5.QtWidgets import (
 
 from py4D_browser.utils import DetectorMode, DetectorShape
 
-from . import imaging
-from .preview_pane import PreviewPane
+from . import bragg, imaging
+from .preview_pane import BVMPane, PreviewPane
 
 from typing import TYPE_CHECKING
 
@@ -56,6 +58,8 @@ class BetterVirtualImagingPlugin(QWidget):
     def launch_window(self):
         if self.window is None:
             self.window = BetterVirtualImagingWindow(parent=self.parent)
+        else:
+            self.window.load_bvm()
 
         self.window.show()
         self.window.raise_()
@@ -107,7 +111,6 @@ class BetterVirtualImagingWindow(QDialog):
         self.setWindowTitle("Better Virtual Imaging")
 
         apertures_box = self._build_apertures_box()
-        cursor_box = self._build_cursor_box()
         scaling_box = self._build_scaling_box()
 
         self.add_pane_button = QPushButton("Add Preview")
@@ -115,26 +118,46 @@ class BetterVirtualImagingWindow(QDialog):
 
         controls_layout = QVBoxLayout()
         controls_layout.addWidget(apertures_box)
-        controls_layout.addWidget(cursor_box)
         controls_layout.addWidget(scaling_box)
         controls_layout.addWidget(self.add_pane_button)
         controls_layout.addStretch()
-        controls_widget = QWidget()
-        controls_widget.setLayout(controls_layout)
-        controls_widget.setMaximumWidth(280)
+        self.controls_widget = QWidget()
+        self.controls_widget.setLayout(controls_layout)
+
+        # At most half the window's height (see _fit_controls_height),
+        # scrolling vertically beyond that -- and never squeezed narrower
+        # than the controls need.
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setWidget(self.controls_widget)
+        self.controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setMinimumWidth(
+            self.controls_widget.minimumSizeHint().width()
+            + self.controls_scroll.verticalScrollBar().sizeHint().width()
+        )
+
+        # The left column: the controls, and below them the Bragg vector map
+        # if there are Bragg vectors saved with the dataset.
+        self.bvm_pane = None
+        self.left_layout = QVBoxLayout()
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.addWidget(self.controls_scroll)
+        self.left_layout.addStretch()
+        left_column = QWidget()
+        left_column.setLayout(self.left_layout)
 
         self.previews_layout = QGridLayout()
         self.views = QWidget()
         self.views.setLayout(self.previews_layout)
 
-        splitter = QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(controls_widget)
-        splitter.addWidget(self.views)
-        splitter.setCollapsible(0, False)
-        splitter.setSizes([280, 1120])
+        self.main_splitter = QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.addWidget(left_column)
+        self.main_splitter.addWidget(self.views)
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setSizes([300, 1100])
 
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
+        layout.addWidget(self.main_splitter)
 
         self.resize(1400, 800)
 
@@ -150,8 +173,21 @@ class BetterVirtualImagingWindow(QDialog):
         parent.signal_diffraction_data_changed.connect(self.on_main_diffraction_changed)
 
         self._append_pane()
+        self.load_bvm()
+        self._fit_controls_height()
 
         self.disable_auto_default(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_controls_height()
+
+    def _fit_controls_height(self):
+        content_height = (
+            self.controls_widget.sizeHint().height()
+            + 2 * self.controls_scroll.frameWidth()
+        )
+        self.controls_scroll.setFixedHeight(min(content_height, self.height() // 2))
 
     def disable_auto_default(self, widget):
         # QDialog makes every push button in it "auto-default", drawing the
@@ -193,31 +229,9 @@ class BetterVirtualImagingWindow(QDialog):
         radius_form.addRow("Radius (px)", self.radius_spin)
         radius_form.addRow(self.use_bf_radius_checkbox)
 
-        hint = QLabel(
-            "Click a diffraction pattern to add an aperture there. Drag an "
-            "aperture to move it, use its handle to resize it, and right-click "
-            "it to remove it."
-        )
-        hint.setWordWrap(True)
-
         layout = QVBoxLayout()
         layout.addWidget(self.add_on_click_button)
         layout.addLayout(radius_form)
-        layout.addWidget(hint)
-        box.setLayout(layout)
-        return box
-
-    def _build_cursor_box(self):
-        box = QGroupBox("Real-Space Cursor")
-        hint = QLabel(
-            "Follows the main window's Detector Shape > Virtual Image setting: "
-            "a point shows the pattern at that scan position, a rectangle the "
-            "mean pattern over it (or the maximum, with Detector Response > "
-            "Virtual Image > Maximum)."
-        )
-        hint.setWordWrap(True)
-        layout = QVBoxLayout()
-        layout.addWidget(hint)
         box.setLayout(layout)
         return box
 
@@ -304,6 +318,8 @@ class BetterVirtualImagingWindow(QDialog):
         )
         for pane in panes if panes is not None else self.panes:
             pane.set_colormaps(realspace_cmap, diffraction_cmap)
+        if self.bvm_pane is not None:
+            self.bvm_pane.set_colormap(diffraction_cmap)
 
     # --- Real-space cursor ---
 
@@ -486,3 +502,45 @@ class BetterVirtualImagingWindow(QDialog):
         for pane in self.panes:
             if pane.last_dp is not None:
                 pane.show_dp(pane.last_dp, scale_fn, relevel=True)
+        if self.bvm_pane is not None:
+            self.bvm_pane.show_bvm(scale_fn)
+
+    # --- Bragg vector map ---
+
+    def load_bvm(self):
+        # Show the Bragg vector map of any Bragg vectors saved with the
+        # dataset. Checked again whenever the window is reopened, as they may
+        # have been saved since (e.g. by the Disk Detection plugin).
+        if self.bvm_pane is not None or not self._has_data():
+            return
+        source = bragg.find_braggvectors(self.parent)
+        if source is None:
+            return
+        filepath, datapath = source
+
+        QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            braggvectors = bragg.read_braggvectors(filepath, datapath)
+            bvm = bragg.bvm(braggvectors)
+        except Exception as exc:
+            self.parent.statusBar().showMessage(
+                f"Couldn't read the Bragg vectors at {datapath}: {exc}", 5_000
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.bvm_pane = BVMPane(bvm, f"{os.path.basename(filepath)}: {datapath}")
+        # Fills the column below the controls, in place of the stretch.
+        self.left_layout.insertWidget(1, self.bvm_pane, stretch=1)
+        self.sync_colormaps(panes=[])
+        self.bvm_pane.show_bvm(self.get_scaling_fn(), first=True)
+
+        # Widen the column to give the map room. (Until the window is first
+        # shown, the splitter reports placeholder sizes, which it later
+        # rescales in proportion.)
+        if not self.isVisible():
+            self.main_splitter.setSizes([400, self.width() - 400])
+        elif self.main_splitter.sizes()[0] < 400:
+            total = sum(self.main_splitter.sizes())
+            self.main_splitter.setSizes([400, total - 400])

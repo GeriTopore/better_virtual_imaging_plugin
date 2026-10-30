@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
 )
 
@@ -22,6 +23,50 @@ CURSOR_HOVER_HANDLE_PEN = {"color": "c", "width": 9}
 # Thinner than the main window's detector, as there can be many apertures.
 APERTURE_PEN = {"color": "g", "width": 2}
 APERTURE_HOVER_PEN = {"color": "c", "width": 2}
+
+
+def show_diffraction_image(view, image, scale_fn, relevel, first):
+    # Transposed to match the main window's diffraction_space_widget
+    # convention (see _render_diffraction_image in update_views.py).
+    scaled = scale_fn(image).T
+
+    if relevel or first:
+        levels = tuple(np.percentile(scaled, [0.1, 99.9]))
+        view.setImage(scaled, autoLevels=False, levels=levels, autoRange=first)
+    else:
+        # Leave levels untouched, so any range the user set by hand on the
+        # histogram survives the cursor moving.
+        view.setImage(scaled, autoLevels=False, autoRange=False)
+
+
+class BVMPane(QGroupBox):
+    """The Bragg vector map of Bragg vectors saved with the dataset."""
+
+    def __init__(self, bvm, source):
+        super().__init__("Bragg Vector Map")
+
+        self.bvm = bvm
+
+        self.view = pg.ImageView()
+        self.view.ui.roiBtn.hide()
+        self.view.ui.menuBtn.hide()
+
+        # A long path can't wrap, so let it clip rather than widen the
+        # column, with the whole of it in the tooltip.
+        label = QLabel(source)
+        label.setToolTip(source)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.view)
+        layout.addWidget(label)
+        self.setLayout(layout)
+
+    def set_colormap(self, diffraction_cmap):
+        self.view.setColorMap(diffraction_cmap)
+
+    def show_bvm(self, scale_fn, first=False):
+        show_diffraction_image(self.view, self.bvm, scale_fn, True, first)
 
 
 class PreviewPane(QGroupBox):
@@ -74,15 +119,15 @@ class PreviewPane(QGroupBox):
         header.addStretch()
         header.addWidget(self.clear_apertures_button)
 
-        views = QGridLayout()
-        views.addWidget(self.dp_view, 0, 0)
-        views.addWidget(self.vi_view, 0, 1)
-        views.addWidget(self.dp_label, 1, 0)
-        views.addWidget(self.vi_label, 1, 1)
+        self.views_layout = QGridLayout()
+        self.views_layout.addWidget(self.dp_view, 0, 0)
+        self.views_layout.addWidget(self.vi_view, 0, 1)
+        self.views_layout.addWidget(self.dp_label, 1, 0)
+        self.views_layout.addWidget(self.vi_label, 1, 1)
 
         layout = QVBoxLayout()
         layout.addLayout(header)
-        layout.addLayout(views)
+        layout.addLayout(self.views_layout)
         self.setLayout(layout)
 
     def set_colormaps(self, realspace_cmap, diffraction_cmap):
@@ -100,23 +145,10 @@ class PreviewPane(QGroupBox):
 
     def show_dp(self, dp, scale_fn, relevel):
         self.last_dp = dp
-        # Transposed to match the main window's diffraction_space_widget
-        # convention (see _render_diffraction_image in update_views.py).
-        scaled = scale_fn(dp).T
-
-        if relevel or not self._has_shown_dp:
-            levels = tuple(np.percentile(scaled, [0.1, 99.9]))
-            self.dp_view.setImage(
-                scaled,
-                autoLevels=False,
-                levels=levels,
-                autoRange=not self._has_shown_dp,
-            )
-            self._has_shown_dp = True
-        else:
-            # Leave levels untouched, so any range the user set by hand on
-            # the histogram survives the cursor moving.
-            self.dp_view.setImage(scaled, autoLevels=False, autoRange=False)
+        show_diffraction_image(
+            self.dp_view, dp, scale_fn, relevel, first=not self._has_shown_dp
+        )
+        self._has_shown_dp = True
 
     def _on_dp_clicked(self, ev):
         if ev.button() != QtCore.Qt.LeftButton:
