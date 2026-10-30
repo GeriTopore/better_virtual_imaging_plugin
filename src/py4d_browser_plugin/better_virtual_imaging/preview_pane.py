@@ -1,3 +1,5 @@
+from functools import partial
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore
@@ -9,6 +11,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from py4D_browser.utils import DetectorShape, pg_point_roi
@@ -95,6 +98,8 @@ class PreviewPane(QGroupBox):
         self.rs_shape = None
         self.last_dp = None
         self._has_shown_dp = False
+        self.vimg = None  # the virtual image from the apertures, once there are any
+        self.color = None  # RGB (0-1) chosen for the merged view, if any
 
         self.dp_view = pg.ImageView()
         self.dp_view.setImage(np.zeros((512, 512)))
@@ -124,6 +129,9 @@ class PreviewPane(QGroupBox):
         self.views_layout.addWidget(self.vi_view, 0, 1)
         self.views_layout.addWidget(self.dp_label, 1, 0)
         self.views_layout.addWidget(self.vi_label, 1, 1)
+        # Pattern and image share the width equally, whatever is under them.
+        self.views_layout.setColumnStretch(0, 1)
+        self.views_layout.setColumnStretch(1, 1)
 
         layout = QVBoxLayout()
         layout.addLayout(header)
@@ -301,3 +309,91 @@ class PreviewPane(QGroupBox):
             (slice_x.start + slice_x.stop - 1) // 2,
             (slice_y.start + slice_y.stop - 1) // 2,
         )
+
+
+class MergedPane(PreviewPane):
+    """
+    The previews merged into one: each preview's apertures drawn on a single
+    diffraction pattern in that preview's colour, and their virtual images
+    combined into a colour composite in the same colours. For viewing only --
+    apertures are edited in the separate previews -- apart from the colours,
+    which the legend's swatches let the user choose.
+    """
+
+    # A legend swatch was clicked: the index of its entry.
+    sig_swatch_clicked = QtCore.pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__("Merged Views")
+
+        self.clear_apertures_button.hide()
+        # The composite has fixed levels, so there's nothing to adjust.
+        self.vi_view.ui.histogram.hide()
+
+        # In place of the virtual image label.
+        self.vi_label.hide()
+        self.legend_layout = QHBoxLayout()
+        self.legend_layout.setContentsMargins(0, 0, 0, 0)
+        legend = QWidget()
+        legend.setLayout(self.legend_layout)
+        self.views_layout.addWidget(legend, 1, 1)
+
+        self.markers = pg.ScatterPlotItem(pxMode=False)  # sizes in data pixels
+        self.dp_view.getView().addItem(self.markers)
+
+    def set_colormaps(self, realspace_cmap, diffraction_cmap):
+        # The composite has colours of its own.
+        self.dp_view.setColorMap(diffraction_cmap)
+
+    def show_composite(self, rgb):
+        # Transposed like show_vi, keeping the colour axis last.
+        shown = np.transpose(rgb, (1, 0, 2))
+        self.vi_view.setImage(
+            shown,
+            levels=(0, 1),
+            autoRange=self.vi_view.image.shape[:2] != shown.shape[:2],
+        )
+
+    def set_aperture_markers(self, apertures):
+        """Draw apertures, each ((qx, qy), radius, rgb), as rings in their colour."""
+        # Centred where PreviewPane.add_aperture would draw them.
+        self.markers.setData(
+            [
+                {
+                    "pos": (qy + 0.5, qx + 0.5),
+                    "size": 2 * radius,
+                    "pen": pg.mkPen([int(round(255 * c)) for c in rgb], width=2),
+                    "brush": None,
+                    "symbol": "o",
+                }
+                for (qx, qy), radius, rgb in apertures
+            ]
+        )
+
+    def set_legend(self, entries):
+        """Show a swatch and name for each entry, (name, rgb)."""
+        while self.legend_layout.count():
+            item = self.legend_layout.takeAt(0)
+            if item.widget() is not None:
+                # Deleted later, not now, as this can run from a swatch's own
+                # click -- but hidden at once.
+                item.widget().hide()
+                item.widget().deleteLater()
+
+        self.legend_layout.addWidget(QLabel("Composite:"))
+        self.swatches = []
+        for i, (name, rgb) in enumerate(entries):
+            swatch = QPushButton()
+            swatch.setAutoDefault(False)  # see disable_auto_default
+            swatch.setFixedSize(18, 18)
+            swatch.setCursor(QtCore.Qt.PointingHandCursor)
+            swatch.setToolTip(f"Change the colour of {name}")
+            hex_color = "#" + "".join(f"{int(round(255 * c)):02x}" for c in rgb)
+            swatch.setStyleSheet(
+                f"background-color: {hex_color}; border: 1px solid gray;"
+            )
+            swatch.clicked.connect(partial(self.sig_swatch_clicked.emit, i))
+            self.swatches.append(swatch)
+            self.legend_layout.addWidget(swatch)
+            self.legend_layout.addWidget(QLabel(name))
+        self.legend_layout.addStretch()

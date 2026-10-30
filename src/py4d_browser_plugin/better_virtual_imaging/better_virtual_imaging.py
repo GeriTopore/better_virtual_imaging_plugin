@@ -3,10 +3,12 @@ from functools import partial
 
 import numpy as np
 from PyQt5 import QtCore
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -25,7 +27,7 @@ from PyQt5.QtWidgets import (
 from py4D_browser.utils import DetectorMode, DetectorShape
 
 from . import bragg, imaging
-from .preview_pane import BVMPane, PreviewPane
+from .preview_pane import BVMPane, MergedPane, PreviewPane
 
 from typing import TYPE_CHECKING
 
@@ -116,10 +118,19 @@ class BetterVirtualImagingWindow(QDialog):
         self.add_pane_button = QPushButton("Add Preview")
         self.add_pane_button.clicked.connect(self.add_pane)
 
+        # Toggles between the separate previews and a merged view of them
+        # (built on first use, then hidden rather than deleted).
+        self.merged_pane = None
+        self.merged = []  # the previews in the merged view, in order
+        self.merge_button = QPushButton("Merge Views")
+        self.merge_button.setCheckable(True)
+        self.merge_button.toggled.connect(self.on_merge_toggled)
+
         controls_layout = QVBoxLayout()
         controls_layout.addWidget(apertures_box)
         controls_layout.addWidget(scaling_box)
         controls_layout.addWidget(self.add_pane_button)
+        controls_layout.addWidget(self.merge_button)
         controls_layout.addStretch()
         self.controls_widget = QWidget()
         self.controls_widget.setLayout(controls_layout)
@@ -310,13 +321,20 @@ class BetterVirtualImagingWindow(QDialog):
         for i, pane in enumerate(self.panes):
             self.previews_layout.addWidget(pane, i // columns, i % columns)
 
+    def _cursor_panes(self):
+        # Every pane with a diffraction pattern and real-space cursor: the
+        # previews, and the merged view once there is one.
+        if self.merged_pane is None:
+            return self.panes
+        return self.panes + [self.merged_pane]
+
     def sync_colormaps(self, *_, panes=None):
         parent = self.parent
         realspace_cmap = parent.real_space_widget.ui.histogram.gradient.colorMap()
         diffraction_cmap = (
             parent.diffraction_space_widget.ui.histogram.gradient.colorMap()
         )
-        for pane in panes if panes is not None else self.panes:
+        for pane in panes if panes is not None else self._cursor_panes():
             pane.set_colormaps(realspace_cmap, diffraction_cmap)
         if self.bvm_pane is not None:
             self.bvm_pane.set_colormap(diffraction_cmap)
@@ -375,7 +393,7 @@ class BetterVirtualImagingWindow(QDialog):
         if shape is not self.rs_shape:
             # Swap each pane's cursor for the new shape, in the same place.
             Rshape = self.data_shape[:2]
-            for pane in self.panes:
+            for pane in self._cursor_panes():
                 xc, yc = pane.scan_centre(Rshape)
                 if shape is DetectorShape.POINT:
                     pane.set_point_selector(xc, yc)
@@ -398,7 +416,7 @@ class BetterVirtualImagingWindow(QDialog):
         Rshape = self.data_shape[:2]
         scale_fn = self.get_scaling_fn()
 
-        for pane in panes if panes is not None else self.panes:
+        for pane in panes if panes is not None else self._cursor_panes():
             selection = pane.get_scan_selection(Rshape)
             if pane.rs_shape is DetectorShape.POINT:
                 xc, yc = selection
@@ -438,6 +456,7 @@ class BetterVirtualImagingWindow(QDialog):
                     vimg = np.zeros(Rshape)
                 elif np.iscomplexobj(vimg):  # the main window's CoM mode
                     vimg = np.abs(vimg)
+                pane.vimg = None
                 pane.show_vi(vimg)
                 pane.vi_label.setText("Virtual Image: main window's (no apertures)")
                 continue
@@ -448,6 +467,7 @@ class BetterVirtualImagingWindow(QDialog):
                 vimg = imaging.masked_sum(datacube.data, mask)
             finally:
                 QApplication.restoreOverrideCursor()
+            pane.vimg = vimg
             pane.show_vi(vimg)
             n = len(apertures)
             pane.vi_label.setText(f"Virtual Image: {n} aperture{'' if n == 1 else 's'}")
@@ -499,11 +519,128 @@ class BetterVirtualImagingWindow(QDialog):
         # Redisplay each pane's cached pattern with fresh levels for the new
         # scaling.
         scale_fn = self.get_scaling_fn()
-        for pane in self.panes:
+        for pane in self._cursor_panes():
             if pane.last_dp is not None:
                 pane.show_dp(pane.last_dp, scale_fn, relevel=True)
         if self.bvm_pane is not None:
             self.bvm_pane.show_bvm(scale_fn)
+
+    # --- Merged view ---
+
+    def on_merge_toggled(self, checked):
+        if not checked:
+            self._separate_views()
+        elif not self._merge_views():
+            self.merge_button.blockSignals(True)
+            self.merge_button.setChecked(False)
+            self.merge_button.blockSignals(False)
+
+    def _merge_views(self):
+        # Only previews with apertures have a virtual image of their own to
+        # merge; the rest show the main window's.
+        merged = [pane for pane in self.panes if pane.vimg is not None]
+        if not merged or not self._has_data():
+            self.parent.statusBar().showMessage(
+                "Add apertures to a preview to merge its view", 5_000
+            )
+            return False
+
+        if self.merged_pane is None:
+            self.merged_pane = MergedPane()
+            self.merged_pane.sig_scan_selection_changed.connect(
+                partial(self.update_dps, panes=[self.merged_pane])
+            )
+            self.merged_pane.sig_swatch_clicked.connect(self.on_swatch_clicked)
+            self.sync_colormaps(panes=[self.merged_pane])
+
+        # Start the cursor where the first merged preview's is.
+        Rshape = self.data_shape[:2]
+        source = merged[0]
+        xc, yc = source.scan_centre(Rshape)
+        if source.rs_shape is DetectorShape.POINT:
+            self.merged_pane.set_point_selector(xc, yc)
+        else:
+            like = source.get_scan_selection(Rshape)
+            self.merged_pane.set_rect_selector(*self._rect_around(xc, yc, like=like))
+
+        self.merged = merged
+        self._show_merged()
+
+        for pane in self.panes:
+            self.previews_layout.removeWidget(pane)
+            pane.hide()
+        self.previews_layout.addWidget(self.merged_pane, 0, 0)
+        self.merged_pane.show()
+        self.update_dps(panes=[self.merged_pane])
+
+        self.add_pane_button.setEnabled(False)
+        return True
+
+    def _merged_colors(self):
+        # Each merged preview's chosen colour, or else its default.
+        defaults = imaging.composite_colors(len(self.merged))
+        return [
+            pane.color if pane.color is not None else default
+            for pane, default in zip(self.merged, defaults)
+        ]
+
+    def _show_merged(self):
+        colors = self._merged_colors()
+        self.merged_pane.show_composite(
+            imaging.color_composite([pane.vimg for pane in self.merged], colors)
+        )
+        self.merged_pane.set_aperture_markers(
+            [
+                (centre, radius, color)
+                for pane, color in zip(self.merged, colors)
+                for centre, radius in pane.aperture_geometries()
+            ]
+        )
+        self.merged_pane.set_legend(
+            [(pane.title(), color) for pane, color in zip(self.merged, colors)]
+        )
+
+    def on_swatch_clicked(self, index):
+        pane = self.merged[index]
+        dialog = QColorDialog(QColor.fromRgbF(*self._merged_colors()[index]), self)
+        dialog.setWindowTitle(f"Colour for {pane.title()}")
+        # Qt's own dialog rather than the native macOS colour panel, which
+        # can't be placed, and which on closing hands focus to the main
+        # window -- burying this one behind it.
+        dialog.setOption(QColorDialog.DontUseNativeDialog)
+        self._place_next_to(dialog, self.merged_pane.swatches[index])
+        accepted = dialog.exec_() == QDialog.Accepted
+        self.raise_()
+        self.activateWindow()
+        if not accepted:
+            return
+        pane.color = dialog.selectedColor().getRgbF()[:3]
+        self._show_merged()
+
+    def _place_next_to(self, dialog, widget):
+        # Just below the widget, or above it if there isn't room, kept on
+        # the widget's screen.
+        dialog.adjustSize()
+        # Until it's shown, the dialog's frame doesn't include its title bar;
+        # take that from this window's.
+        title_bar = self.frameGeometry().height() - self.geometry().height()
+        width = dialog.frameGeometry().width()
+        height = dialog.frameGeometry().height() + title_bar
+        screen = widget.screen().availableGeometry()
+        below = widget.mapToGlobal(QtCore.QPoint(0, widget.height()))
+        above_y = widget.mapToGlobal(QtCore.QPoint(0, 0)).y() - height
+        y = below.y() if below.y() + height <= screen.bottom() else above_y
+        x = min(max(below.x(), screen.left()), screen.right() - width)
+        y = min(max(y, screen.top()), screen.bottom() - height)
+        dialog.move(x, y)
+
+    def _separate_views(self):
+        self.previews_layout.removeWidget(self.merged_pane)
+        self.merged_pane.hide()
+        for pane in self.panes:
+            pane.show()
+        self._layout_panes()
+        self.add_pane_button.setEnabled(len(self.panes) - 1 < self.MAX_ADDITIONAL_PANES)
 
     # --- Bragg vector map ---
 

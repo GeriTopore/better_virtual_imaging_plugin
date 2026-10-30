@@ -1,5 +1,6 @@
 import numpy as np
 import py4DSTEM
+from matplotlib.colors import hsv_to_rgb
 from py4DSTEM.process.calibration import get_probe_size
 
 # Most scratch memory a virtual image computation converts to float at once.
@@ -69,3 +70,38 @@ def measure_bf_radius(data):
     """
     radius, _, _ = get_probe_size(mean_dp(data))
     return float(radius)
+
+
+def composite_colors(n):
+    """
+    Default RGB (0-1) colours for n images in a colour composite: hues evenly
+    spaced around the colour wheel from red, at full saturation and value
+    (as py4DSTEM.show(..., combine_images=True) uses).
+    """
+    return [tuple(float(c) for c in hsv_to_rgb((i / n, 1.0, 1.0))) for i in range(n)]
+
+
+def _scale_ordered(image, vmin=0.02, vmax=0.98):
+    # py4DSTEM.show's default intensity_range="ordered": scale to [0, 1]
+    # between the values ranked at the vmin and vmax fractions, clipping.
+    vals = np.sort(image[~np.isnan(image)])
+    lo = vals[max(0, int(np.round((vals.size - 1) * vmin)))]
+    hi = vals[min(vals.size - 1, int(np.round((vals.size - 1) * vmax)))]
+    if hi == lo:
+        lo, hi = vals[0], vals[-1]
+    if hi == lo:
+        return np.zeros(image.shape)
+    return np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+
+
+def color_composite(images, colors):
+    """
+    An RGB (0-1) colour composite of same-shaped images, each in its own RGB
+    (0-1) colour: every image is scaled to [0, 1] as py4DSTEM.show does by
+    default, tinted with its colour, and the tinted images are added,
+    clipping at white where they overlap brightly.
+    """
+    rgb = np.zeros(images[0].shape + (3,))
+    for image, color in zip(images, colors):
+        rgb += _scale_ordered(image)[..., None] * np.asarray(color)
+    return np.clip(rgb, 0.0, 1.0)
