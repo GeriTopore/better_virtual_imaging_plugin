@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QPushButton,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -89,6 +90,8 @@ class PreviewPane(QGroupBox):
     # A left click on the diffraction pattern, outside any existing aperture,
     # at (qx, qy) in data coordinates.
     sig_dp_clicked = QtCore.pyqtSignal(float, float)
+    # The pane's remove button was clicked.
+    sig_remove_requested = QtCore.pyqtSignal()
 
     def __init__(self, title):
         super().__init__(title)
@@ -120,9 +123,16 @@ class PreviewPane(QGroupBox):
         self.clear_apertures_button = QPushButton("Clear Apertures")
         self.clear_apertures_button.clicked.connect(self.clear_apertures)
 
+        self.remove_button = QToolButton()
+        self.remove_button.setText("\u2715")
+        self.remove_button.setAutoRaise(True)
+        self.remove_button.setToolTip("Remove this preview")
+        self.remove_button.clicked.connect(self.sig_remove_requested.emit)
+
         header = QHBoxLayout()
         header.addStretch()
         header.addWidget(self.clear_apertures_button)
+        header.addWidget(self.remove_button)
 
         self.views_layout = QGridLayout()
         self.views_layout.addWidget(self.dp_view, 0, 0)
@@ -327,6 +337,7 @@ class MergedPane(PreviewPane):
         super().__init__("Merged Views")
 
         self.clear_apertures_button.hide()
+        self.remove_button.hide()
         # The composite has fixed levels, so there's nothing to adjust.
         self.vi_view.ui.histogram.hide()
 

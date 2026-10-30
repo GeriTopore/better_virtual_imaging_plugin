@@ -296,6 +296,7 @@ class BetterVirtualImagingWindow(QDialog):
         pane.sig_scan_selection_changed.connect(partial(self.update_dps, panes=[pane]))
         pane.sig_apertures_changed.connect(partial(self.update_vis, panes=[pane]))
         pane.sig_dp_clicked.connect(partial(self.on_dp_clicked, pane))
+        pane.sig_remove_requested.connect(partial(self.remove_pane, pane))
         pane.set_click_to_add(self.add_on_click_button.isChecked())
         self.panes.append(pane)
         self._layout_panes()
@@ -306,11 +307,33 @@ class BetterVirtualImagingWindow(QDialog):
         self.update_vis(panes=[pane])
         self.update_dps(panes=[pane])
 
-        if len(self.panes) - 1 >= self.MAX_ADDITIONAL_PANES:
-            self.add_pane_button.setEnabled(False)
+        self._update_pane_buttons()
 
     def add_pane(self):
         self._append_pane()
+
+    def remove_pane(self, pane):
+        if len(self.panes) <= 1:
+            return
+        self.panes.remove(pane)
+        self.previews_layout.removeWidget(pane)
+        pane.hide()
+        pane.deleteLater()
+
+        # Keep the previews numbered in order.
+        for i, remaining in enumerate(self.panes):
+            remaining.setTitle(f"Preview {i + 1}")
+        self._layout_panes()
+        self._update_pane_buttons()
+
+    def _update_pane_buttons(self):
+        # No adding past the cap, or while merged; no removing the last one.
+        self.add_pane_button.setEnabled(
+            len(self.panes) - 1 < self.MAX_ADDITIONAL_PANES
+            and not self.merge_button.isChecked()
+        )
+        for pane in self.panes:
+            pane.remove_button.setVisible(len(self.panes) > 1)
 
     def _layout_panes(self):
         # One pane fills the window, like the main window; two stack, and
@@ -573,7 +596,7 @@ class BetterVirtualImagingWindow(QDialog):
         self.merged_pane.show()
         self.update_dps(panes=[self.merged_pane])
 
-        self.add_pane_button.setEnabled(False)
+        self._update_pane_buttons()
         return True
 
     def _merged_colors(self):
@@ -640,7 +663,7 @@ class BetterVirtualImagingWindow(QDialog):
         for pane in self.panes:
             pane.show()
         self._layout_panes()
-        self.add_pane_button.setEnabled(len(self.panes) - 1 < self.MAX_ADDITIONAL_PANES)
+        self._update_pane_buttons()
 
     # --- Bragg vector map ---
 
