@@ -120,6 +120,11 @@ class PreviewPane(QGroupBox):
         self.dp_view.setImage(np.zeros((512, 512)))
         self.dp_view.scene.sigMouseClicked.connect(self._on_dp_clicked)
 
+        # Bragg peaks detected in the pattern shown (see set_peaks).
+        self.peak_dots = pg.ScatterPlotItem(size=5, pen=None, brush="r")
+        self.peak_dots.setZValue(5)  # over the pattern, under array markers
+        self.dp_view.getView().addItem(self.peak_dots)
+
         self.vi_view = pg.ImageView()
         self.vi_view.setImage(np.zeros((25, 25)))
 
@@ -232,6 +237,15 @@ class PreviewPane(QGroupBox):
             viewport.unsetCursor()
 
     # --- Diffraction pattern and apertures ---
+
+    def set_peaks(self, peaks):
+        """Mark Bragg peaks, an (N, 2) array of (qx, qy), or none if None."""
+        if peaks is None or len(peaks) == 0:
+            self.peak_dots.clear()
+            return
+        # Displayed transposed, with data pixel (qx, qy) centred at
+        # (qy + 0.5, qx + 0.5).
+        self.peak_dots.setData(x=peaks[:, 1] + 0.5, y=peaks[:, 0] + 0.5)
 
     def show_dp(self, dp, scale_fn, relevel):
         self.last_dp = dp

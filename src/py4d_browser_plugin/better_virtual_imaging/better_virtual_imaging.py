@@ -249,7 +249,7 @@ class BetterVirtualImagingWindow(QDialog):
         return box
 
     def _build_scaling_box(self):
-        scaling_box = QGroupBox("Diffraction Scaling")
+        scaling_box = QGroupBox("Diffraction Display")
         scaling_layout = QVBoxLayout()
 
         self.scaling_group = QButtonGroup(self)
@@ -275,6 +275,17 @@ class BetterVirtualImagingWindow(QDialog):
         self.gamma_spin.valueChanged.connect(self.on_scaling_changed)
         gamma_row.addWidget(self.gamma_spin)
         scaling_layout.addLayout(gamma_row)
+
+        # Enabled once there are Bragg vectors (see load_bvm).
+        self.show_peaks_checkbox = QCheckBox("Show detected peaks")
+        self.show_peaks_checkbox.setEnabled(False)
+        self.show_peaks_checkbox.setToolTip(
+            "Mark the Bragg peaks detected at each preview's cursor (every scan "
+            "position in a rectangle) -- needs Bragg vectors saved with the "
+            "dataset"
+        )
+        self.show_peaks_checkbox.toggled.connect(lambda: self.update_peaks())
+        scaling_layout.addWidget(self.show_peaks_checkbox)
 
         scaling_box.setLayout(scaling_layout)
         return scaling_box
@@ -465,6 +476,13 @@ class BetterVirtualImagingWindow(QDialog):
                     f"{slice_y.start}:{slice_y.stop}]"
                 )
             pane.show_dp(dp, scale_fn, relevel=relevel)
+        self.update_peaks(panes)
+
+    def update_peaks(self, panes=None):
+        # The detected peaks in each pane's pattern, if they're to be shown.
+        show = self.show_peaks_checkbox.isChecked()
+        for pane in panes if panes is not None else self._cursor_panes():
+            pane.set_peaks(self._bragg_peaks(pane) if show else None)
 
     def update_vis(self, panes=None):
         # The virtual image from each pane's apertures -- or, until it has
@@ -749,6 +767,7 @@ class BetterVirtualImagingWindow(QDialog):
         self.braggvectors = braggvectors
         for pane in self.panes:
             pane.set_snap_available(True)
+        self.show_peaks_checkbox.setEnabled(True)
 
         self.bvm_pane = BVMPane(bvm, f"{os.path.basename(filepath)}: {datapath}")
         # Fills the column below the controls, in place of the stretch.
