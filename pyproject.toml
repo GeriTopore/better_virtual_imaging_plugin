@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "better_virtual_imaging"
+version = "0.1"
+authors = [{ name = "Geri Topore", email = "g.topore22@imperial.ac.uk" }]
+description = "Enables better virtual imaging of 4D-STEM data within py4d_browser"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "py4D_browser",
+    "py4dstem >= 0.14.8",
+    "numpy >= 1.19",
+    "pyqtgraph >= 0.11",
+    "PyQt5 >= 5.10",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/GeriTopore/better_virtual_imaging_plugin"
+"Bug Tracker" = "https://github.com/GeriTopore/better_virtual_imaging_plugin/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
