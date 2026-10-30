@@ -92,3 +92,6 @@ Untitled.ipynb
 
 # Local test data
 *.h5
+
+# Parameter files the Disk Detection plugin writes next to the data
+*_disk_detection_params.txt
