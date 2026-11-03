@@ -1,4 +1,3 @@
-import os
 from functools import partial
 
 import numpy as np
@@ -16,9 +15,11 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -26,9 +27,10 @@ from PyQt5.QtWidgets import (
 
 from py4D_browser.utils import DetectorMode, DetectorShape
 
-from . import bragg, imaging
+from . import bragg, imaging, processing
+from .correction_dialog import PixelCorrectionDialog
 from .lattice import GVectorArray
-from .preview_pane import BVMPane, MergedPane, PreviewPane
+from .preview_pane import MergedPane, PreviewPane
 
 from typing import TYPE_CHECKING
 
@@ -62,7 +64,7 @@ class BetterVirtualImagingPlugin(QWidget):
         if self.window is None:
             self.window = BetterVirtualImagingWindow(parent=self.parent)
         else:
-            self.window.load_bvm()
+            self.window.load_braggvectors()
 
         self.window.show()
         self.window.raise_()
@@ -72,7 +74,7 @@ class BetterVirtualImagingPlugin(QWidget):
         # Anything the window computed belongs to the old dataset, so start
         # over with a fresh window -- reopened in the same place if it was
         # open.
-        if self.window is None:
+        if self.window is None or self.window.keep_through_data_change:
             return
         old_window, self.window = self.window, None
         was_visible = old_window.isVisible()
@@ -86,15 +88,18 @@ class BetterVirtualImagingPlugin(QWidget):
 
 
 class BetterVirtualImagingWindow(QDialog):
-    # Start with a single preview pane; this caps how many more the user can
-    # add via the "Add Preview" button.
-    MAX_ADDITIONAL_PANES = 3
-
     def __init__(self, parent: "DataViewer"):
         super().__init__(parent=parent)
 
         self.parent = parent
         self.panes = []
+
+        # The mean and maximum patterns, computed when first needed.
+        self.patterns = {}
+        # Set while this window announces a change it made to the dataset's
+        # values (not its shape), which it updates itself for, rather than
+        # being rebuilt (see BetterVirtualImagingPlugin.on_datacube_changed).
+        self.keep_through_data_change = False
 
         # The window is rebuilt for every new dataset, but the main window
         # redraws (and emits signal_diffraction_data_changed) for a new one
@@ -115,30 +120,23 @@ class BetterVirtualImagingWindow(QDialog):
 
         apertures_box = self._build_apertures_box()
         scaling_box = self._build_scaling_box()
+        binning_box = self._build_binning_box()
+        bad_pixels_box = self._build_bad_pixels_box()
 
         self.add_pane_button = QPushButton("Add Preview")
         self.add_pane_button.clicked.connect(self.add_pane)
 
-        # Toggles between the separate previews and a merged view of them
-        # (built on first use, then hidden rather than deleted).
-        self.merged_pane = None
-        self.merged = []  # the previews in the merged view, in order
-        self.merge_button = QPushButton("Merge Views")
-        self.merge_button.setCheckable(True)
-        self.merge_button.toggled.connect(self.on_merge_toggled)
-
         controls_layout = QVBoxLayout()
         controls_layout.addWidget(apertures_box)
         controls_layout.addWidget(scaling_box)
-        controls_layout.addWidget(self.add_pane_button)
-        controls_layout.addWidget(self.merge_button)
+        controls_layout.addWidget(binning_box)
+        controls_layout.addWidget(bad_pixels_box)
         controls_layout.addStretch()
         self.controls_widget = QWidget()
         self.controls_widget.setLayout(controls_layout)
 
-        # At most half the window's height (see _fit_controls_height),
-        # scrolling vertically beyond that -- and never squeezed narrower
-        # than the controls need.
+        # Scrolling vertically if the window's too short for the controls,
+        # and never squeezed narrower than they need.
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setWidget(self.controls_widget)
@@ -148,24 +146,45 @@ class BetterVirtualImagingWindow(QDialog):
             + self.controls_scroll.verticalScrollBar().sizeHint().width()
         )
 
-        # The left column: the controls, and below them the Bragg vector map
-        # if there are Bragg vectors saved with the dataset.
-        self.bvm_pane = None
         self.braggvectors = None  # kept for snapping g-vector arrays to peaks
-        self.left_layout = QVBoxLayout()
-        self.left_layout.setContentsMargins(0, 0, 0, 0)
-        self.left_layout.addWidget(self.controls_scroll)
-        self.left_layout.addStretch()
-        left_column = QWidget()
-        left_column.setLayout(self.left_layout)
 
-        self.previews_layout = QGridLayout()
+        # Toggles between the separate previews and a merged view of them
+        # (built on first use, then hidden rather than deleted).
+        self.merged_pane = None
+        self.merged = []  # the previews in the merged view, in order
+        self.merge_button = QPushButton("Merge Views")
+        self.merge_button.setCheckable(True)
+        self.merge_button.setToolTip(
+            "Combine the previews with apertures into one view, each in its "
+            "own colour"
+        )
+        self.merge_button.toggled.connect(self.on_merge_toggled)
+
+        # The previews, one per row, sharing the height until they'd be
+        # squeezed below PANE_MIN_HEIGHT, then scrolling.
+        self.previews_layout = QVBoxLayout()
+        self.previews_layout.setContentsMargins(0, 0, 0, 0)
         self.views = QWidget()
         self.views.setLayout(self.previews_layout)
+        self.previews_scroll = QScrollArea()
+        self.previews_scroll.setWidgetResizable(True)
+        self.previews_scroll.setWidget(self.views)
+        self.previews_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        previews_header = QHBoxLayout()
+        previews_header.addWidget(self.add_pane_button)
+        previews_header.addWidget(self.merge_button)
+        previews_header.addStretch()
+        previews_layout = QVBoxLayout()
+        previews_layout.setContentsMargins(0, 0, 0, 0)
+        previews_layout.addLayout(previews_header)
+        previews_layout.addWidget(self.previews_scroll)
+        previews_column = QWidget()
+        previews_column.setLayout(previews_layout)
 
         self.main_splitter = QSplitter(QtCore.Qt.Horizontal)
-        self.main_splitter.addWidget(left_column)
-        self.main_splitter.addWidget(self.views)
+        self.main_splitter.addWidget(self.controls_scroll)
+        self.main_splitter.addWidget(previews_column)
         self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setSizes([300, 1100])
 
@@ -186,21 +205,9 @@ class BetterVirtualImagingWindow(QDialog):
         parent.signal_diffraction_data_changed.connect(self.on_main_diffraction_changed)
 
         self._append_pane()
-        self.load_bvm()
-        self._fit_controls_height()
+        self.load_braggvectors()
 
         self.disable_auto_default(self)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit_controls_height()
-
-    def _fit_controls_height(self):
-        content_height = (
-            self.controls_widget.sizeHint().height()
-            + 2 * self.controls_scroll.frameWidth()
-        )
-        self.controls_scroll.setFixedHeight(min(content_height, self.height() // 2))
 
     def disable_auto_default(self, widget):
         # QDialog makes every push button in it "auto-default", drawing the
@@ -276,7 +283,7 @@ class BetterVirtualImagingWindow(QDialog):
         gamma_row.addWidget(self.gamma_spin)
         scaling_layout.addLayout(gamma_row)
 
-        # Enabled once there are Bragg vectors (see load_bvm).
+        # Enabled once there are Bragg vectors (see load_braggvectors).
         self.show_peaks_checkbox = QCheckBox("Show detected peaks")
         self.show_peaks_checkbox.setEnabled(False)
         self.show_peaks_checkbox.setToolTip(
@@ -290,6 +297,106 @@ class BetterVirtualImagingWindow(QDialog):
         scaling_box.setLayout(scaling_layout)
         return scaling_box
 
+    def _build_binning_box(self):
+        box = QGroupBox("Binning")
+
+        self.shape_label = QLabel()
+        self.shape_label.setWordWrap(True)
+        self._update_shape_label()
+
+        # Bin factor and button, for diffraction space (Q) and real space (R).
+        self.bin_spins = {}
+        layout = QGridLayout()
+        layout.addWidget(self.shape_label, 0, 0, 1, 3)
+        rows = (
+            ("Q", "Diffraction", "pixels in every pattern"),
+            ("R", "Scan", "scan positions"),
+        )
+        for row, (axis, name, blocks) in enumerate(rows, 1):
+            spin = QSpinBox()
+            spin.setRange(2, 2 if self.data_shape is None else self._max_bin(axis))
+            spin.setPrefix("\u00d7")
+            button = QPushButton(f"Bin {axis}")
+            button.setToolTip(
+                f"Sum each N x N block of {blocks} (py4DSTEM's bin_{axis}), in "
+                "the main window's dataset too"
+            )
+            button.clicked.connect(partial(self.on_bin, axis))
+            button.setEnabled(self.data_shape is not None)
+            self.bin_spins[axis] = spin
+            layout.addWidget(QLabel(name), row, 0)
+            layout.addWidget(spin, row, 1)
+            layout.addWidget(button, row, 2)
+        box.setLayout(layout)
+        return box
+
+    def _max_bin(self, axis):
+        shape = self.data_shape[2:] if axis == "Q" else self.data_shape[:2]
+        return max(2, min(shape))
+
+    def _update_shape_label(self):
+        if self.data_shape is None:
+            self.shape_label.setText("No data")
+            return
+        R_Nx, R_Ny, Q_Nx, Q_Ny = self.data_shape
+        self.shape_label.setText(
+            f"Scan {R_Nx} \u00d7 {R_Ny}, patterns {Q_Nx} \u00d7 {Q_Ny}"
+        )
+
+    def _build_bad_pixels_box(self):
+        box = QGroupBox("Bad Pixels")
+
+        self.hot_thresh_spin = QDoubleSpinBox()
+        self.hot_thresh_spin.setDecimals(2)
+        self.hot_thresh_spin.setRange(0.01, 1000)
+        self.hot_thresh_spin.setSingleStep(0.1)
+        self.hot_thresh_spin.setValue(1.0)
+        self.hot_thresh_spin.setSuffix(" \u00d7 mean")
+        self.hot_thresh_spin.setToolTip(
+            "A pixel is hot if, in the mean pattern, it's brighter than the "
+            "second brightest pixel around it by more than this many times the "
+            "pattern's average intensity (py4DSTEM's filter_hot_pixels)"
+        )
+        hot_button = QPushButton("Filter Hot Pixels")
+        hot_button.clicked.connect(partial(self.on_fix_pixels, "hot"))
+
+        self.dead_fraction_spin = QDoubleSpinBox()
+        self.dead_fraction_spin.setDecimals(2)
+        self.dead_fraction_spin.setRange(0.01, 1.0)
+        self.dead_fraction_spin.setSingleStep(0.05)
+        self.dead_fraction_spin.setValue(0.1)
+        self.dead_fraction_spin.setSuffix(" \u00d7 neighbours")
+        self.dead_fraction_spin.setToolTip(
+            "A pixel is dead if, in the mean pattern, it's dimmer than this "
+            "fraction of the median of the 8 pixels around it"
+        )
+        dead_button = QPushButton("Fix Dead Pixels")
+        dead_button.clicked.connect(partial(self.on_fix_pixels, "dead"))
+
+        for button in (hot_button, dead_button):
+            button.setEnabled(self.data_shape is not None)
+
+        self.pixels_status = QLabel()
+        self.pixels_status.setWordWrap(True)
+
+        note = QLabel(
+            "Each is replaced, in every pattern, by the median of the pixels "
+            "around it."
+        )
+        note.setWordWrap(True)
+
+        layout = QGridLayout()
+        layout.addWidget(QLabel("Hot above"), 0, 0)
+        layout.addWidget(self.hot_thresh_spin, 0, 1)
+        layout.addWidget(hot_button, 1, 0, 1, 2)
+        layout.addWidget(QLabel("Dead below"), 2, 0)
+        layout.addWidget(self.dead_fraction_spin, 2, 1)
+        layout.addWidget(dead_button, 3, 0, 1, 2)
+        layout.addWidget(note, 4, 0, 1, 2)
+        layout.addWidget(self.pixels_status, 5, 0, 1, 2)
+        box.setLayout(layout)
+        return box
+
     def get_scaling_fn(self):
         gamma = self.gamma_spin.value()
         if self.linear_radio.isChecked():
@@ -302,15 +409,15 @@ class BetterVirtualImagingWindow(QDialog):
     # --- Panes ---
 
     def _append_pane(self):
-        if len(self.panes) - 1 >= self.MAX_ADDITIONAL_PANES:
-            return
-
         pane = PreviewPane(f"Preview {len(self.panes) + 1}")
         pane.sig_scan_selection_changed.connect(partial(self.update_dps, panes=[pane]))
         pane.sig_apertures_changed.connect(partial(self.update_vis, panes=[pane]))
         pane.sig_dp_clicked.connect(partial(self.on_dp_clicked, pane))
         pane.sig_remove_requested.connect(partial(self.remove_pane, pane))
         pane.sig_array_toggled.connect(partial(self.on_array_toggled, pane))
+        pane.sig_pattern_mode_changed.connect(
+            partial(self.update_dps, panes=[pane], relevel=True)
+        )
         pane.set_snap_available(self.braggvectors is not None)
         pane.set_click_to_add(self.add_on_click_button.isChecked())
         self.panes.append(pane)
@@ -323,6 +430,10 @@ class BetterVirtualImagingWindow(QDialog):
         self.update_dps(panes=[pane])
 
         self._update_pane_buttons()
+        # Once it's laid out, scroll to it if it's below the others.
+        QtCore.QTimer.singleShot(
+            0, lambda: self.previews_scroll.ensureWidgetVisible(pane)
+        )
 
     def add_pane(self):
         self._append_pane()
@@ -342,22 +453,17 @@ class BetterVirtualImagingWindow(QDialog):
         self._update_pane_buttons()
 
     def _update_pane_buttons(self):
-        # No adding past the cap, or while merged; no removing the last one.
-        self.add_pane_button.setEnabled(
-            len(self.panes) - 1 < self.MAX_ADDITIONAL_PANES
-            and not self.merge_button.isChecked()
-        )
+        # No adding while merged; no removing the last one.
+        self.add_pane_button.setEnabled(not self.merge_button.isChecked())
         for pane in self.panes:
             pane.remove_button.setVisible(len(self.panes) > 1)
 
     def _layout_panes(self):
-        # One pane fills the window, like the main window; two stack, and
-        # more go in a 2x2 grid.
-        columns = 1 if len(self.panes) <= 2 else 2
+        # One per row, in order.
         for pane in self.panes:
             self.previews_layout.removeWidget(pane)
-        for i, pane in enumerate(self.panes):
-            self.previews_layout.addWidget(pane, i // columns, i % columns)
+        for pane in self.panes:
+            self.previews_layout.addWidget(pane)
 
     def _cursor_panes(self):
         # Every pane with a diffraction pattern and real-space cursor: the
@@ -374,8 +480,6 @@ class BetterVirtualImagingWindow(QDialog):
         )
         for pane in panes if panes is not None else self._cursor_panes():
             pane.set_colormaps(realspace_cmap, diffraction_cmap)
-        if self.bvm_pane is not None:
-            self.bvm_pane.set_colormap(diffraction_cmap)
 
     # --- Real-space cursor ---
 
@@ -455,6 +559,13 @@ class BetterVirtualImagingWindow(QDialog):
         scale_fn = self.get_scaling_fn()
 
         for pane in panes if panes is not None else self._cursor_panes():
+            mode = pane.pattern_mode()
+            if mode != "cursor":
+                name = "Mean" if mode == "mean" else "Maximum"
+                pane.dp_label.setText(f"Diffraction: {name} of all patterns")
+                pane.show_dp(self.overall_pattern(mode), scale_fn, relevel=relevel)
+                continue
+
             selection = pane.get_scan_selection(Rshape)
             if pane.rs_shape is DetectorShape.POINT:
                 xc, yc = selection
@@ -477,6 +588,20 @@ class BetterVirtualImagingWindow(QDialog):
                 )
             pane.show_dp(dp, scale_fn, relevel=relevel)
         self.update_peaks(panes)
+
+    def overall_pattern(self, kind):
+        """The "mean" or "max" of every pattern in the scan, computed once."""
+        if kind not in self.patterns:
+            data = self.parent.datacube.data
+            QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                if kind == "mean":
+                    self.patterns[kind] = imaging.mean_dp(data)
+                else:
+                    self.patterns[kind] = imaging.max_dp(data)
+            finally:
+                QApplication.restoreOverrideCursor()
+        return self.patterns[kind]
 
     def update_peaks(self, panes=None):
         # The detected peaks in each pane's pattern, if they're to be shown.
@@ -551,7 +676,7 @@ class BetterVirtualImagingWindow(QDialog):
             return self.bf_disk
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.bf_disk = imaging.measure_bf_disk(self.parent.datacube.data)
+            self.bf_disk = imaging.measure_bf_disk(self.overall_pattern("mean"))
         except Exception as exc:
             self.parent.statusBar().showMessage(
                 f"Couldn't measure the BF disk: {exc}", 5_000
@@ -619,8 +744,6 @@ class BetterVirtualImagingWindow(QDialog):
         for pane in self._cursor_panes():
             if pane.last_dp is not None:
                 pane.show_dp(pane.last_dp, scale_fn, relevel=True)
-        if self.bvm_pane is not None:
-            self.bvm_pane.show_bvm(scale_fn)
 
     # --- Merged view ---
 
@@ -666,7 +789,7 @@ class BetterVirtualImagingWindow(QDialog):
         for pane in self.panes:
             self.previews_layout.removeWidget(pane)
             pane.hide()
-        self.previews_layout.addWidget(self.merged_pane, 0, 0)
+        self.previews_layout.addWidget(self.merged_pane)
         self.merged_pane.show()
         self.update_dps(panes=[self.merged_pane])
 
@@ -739,13 +862,14 @@ class BetterVirtualImagingWindow(QDialog):
         self._layout_panes()
         self._update_pane_buttons()
 
-    # --- Bragg vector map ---
+    # --- Bragg vectors ---
 
-    def load_bvm(self):
-        # Show the Bragg vector map of any Bragg vectors saved with the
-        # dataset. Checked again whenever the window is reopened, as they may
-        # have been saved since (e.g. by the Disk Detection plugin).
-        if self.bvm_pane is not None or not self._has_data():
+    def load_braggvectors(self):
+        # Read any Bragg vectors saved with the dataset, for showing detected
+        # peaks and snapping g-vector arrays to them. Checked again whenever
+        # the window is reopened, as they may have been saved since (e.g. by
+        # the Disk Detection plugin).
+        if self.braggvectors is not None or not self._has_data():
             return
         source = bragg.find_braggvectors(self.parent)
         if source is None:
@@ -755,7 +879,6 @@ class BetterVirtualImagingWindow(QDialog):
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             braggvectors = bragg.read_braggvectors(filepath, datapath)
-            bvm = bragg.bvm(braggvectors)
         except Exception as exc:
             self.parent.statusBar().showMessage(
                 f"Couldn't read the Bragg vectors at {datapath}: {exc}", 5_000
@@ -769,17 +892,131 @@ class BetterVirtualImagingWindow(QDialog):
             pane.set_snap_available(True)
         self.show_peaks_checkbox.setEnabled(True)
 
-        self.bvm_pane = BVMPane(bvm, f"{os.path.basename(filepath)}: {datapath}")
-        # Fills the column below the controls, in place of the stretch.
-        self.left_layout.insertWidget(1, self.bvm_pane, stretch=1)
-        self.sync_colormaps(panes=[])
-        self.bvm_pane.show_bvm(self.get_scaling_fn(), first=True)
+    # --- Processing the dataset ---
 
-        # Widen the column to give the map room. (Until the window is first
-        # shown, the splitter reports placeholder sizes, which it later
-        # rescales in proportion.)
-        if not self.isVisible():
-            self.main_splitter.setSizes([400, self.width() - 400])
-        elif self.main_splitter.sizes()[0] < 400:
-            total = sum(self.main_splitter.sizes())
-            self.main_splitter.setSizes([400, total - 400])
+    def on_bin(self, axis):
+        if not self._has_data():
+            return
+        datacube = self.parent.datacube
+        if not processing.can_bin(datacube.data):
+            QMessageBox.information(
+                self,
+                "Bin Data",
+                "Memory-mapped HDF5 data can't be binned here. Load the file "
+                "without memory mapping, or use File > Load Data Binned.",
+            )
+            return
+
+        N = self.bin_spins[axis].value()
+        shape = self.data_shape[2:] if axis == "Q" else self.data_shape[:2]
+        new_shape = tuple(n // N for n in shape)
+        what = "diffraction patterns" if axis == "Q" else "scan"
+        unit = "pixels" if axis == "Q" else "positions"
+        cropped = any(n % N for n in shape)
+        answer = QMessageBox.question(
+            self,
+            "Bin Data",
+            f"Bin the {what} by {N}, from {shape[0]} \u00d7 {shape[1]} to "
+            f"{new_shape[0]} \u00d7 {new_shape[1]} {unit}"
+            + (" (dropping the leftover rows/columns)" if cropped else "")
+            + "?\n\nThis changes the dataset in the main window too, and starts "
+            "this window afresh. Reload the file to undo it.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            return
+
+        QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            processing.bin_datacube(datacube, axis, N)
+        except Exception as exc:
+            QMessageBox.warning(self, "Bin Data", f"Binning failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Announced as a new dataset, keeping the window title (which other
+        # plugins check against the data's shape before trusting it as the
+        # data's file). The plugin rebuilds this window for it.
+        self.parent.set_datacube(datacube, self.parent.windowTitle())
+        self.parent.statusBar().showMessage(
+            f"Binned {axis} by {N}: data now {' x '.join(map(str, datacube.data.shape))}",
+            5_000,
+        )
+
+    def on_fix_pixels(self, kind):
+        if not self._has_data():
+            return
+        datacube = self.parent.datacube
+        if not processing.can_modify(datacube.data):
+            self.pixels_status.setText(
+                "Memory-mapped data can't be changed here -- load the file "
+                "without memory mapping."
+            )
+            return
+
+        before = self.overall_pattern("mean")
+        if kind == "hot":
+            factor = self.hot_thresh_spin.value()
+            thresh = factor * float(np.mean(before))
+            mask = processing.hot_pixel_mask(before, thresh)
+            criterion = (
+                f"more than {thresh:.3g} counts ({factor:g} \u00d7 the average) "
+                "brighter than the second brightest pixel around them"
+            )
+        else:
+            fraction = self.dead_fraction_spin.value()
+            mask = processing.dead_pixel_mask(before, fraction)
+            criterion = (
+                f"dimmer than {fraction:g} \u00d7 the median of the pixels around them"
+            )
+        n = int(mask.sum())
+        plural = "" if n == 1 else "s"
+        if n == 0:
+            self.pixels_status.setText(f"No {kind} pixels found.")
+            return
+
+        QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            original = processing.replace_pixels(datacube, mask)
+            after = before.copy()
+            after[mask] = processing.masked_mean(datacube.data, mask)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        dialog = PixelCorrectionDialog(
+            f"{kind.capitalize()} Pixels",
+            f"Found {n} {kind} pixel{plural} in the mean pattern -- {criterion} "
+            f"(ringed in red) -- and replaced {'it' if n == 1 else 'them'} in every "
+            "pattern with the median of the "
+            f"{processing.KERNEL_WIDTH} \u00d7 {processing.KERNEL_WIDTH} pixels "
+            "around. Keep the change?",
+            before,
+            after,
+            mask,
+            self.get_scaling_fn(),
+            self.parent.diffraction_space_widget.ui.histogram.gradient.colorMap(),
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            processing.restore_pixels(datacube, mask, original)
+            self.pixels_status.setText(f"Undid replacing {n} {kind} pixel{plural}.")
+            return
+
+        self.pixels_status.setText(f"Replaced {n} {kind} pixel{plural}.")
+        self.patterns = {"mean": after}  # the maximum pattern has changed too
+        self._announce_data_changed()
+
+    def _announce_data_changed(self):
+        # Tell the main window (and other plugins) the dataset's values have
+        # changed in place -- without the plugin rebuilding this window, as
+        # its apertures and previews still apply -- then redraw.
+        self.keep_through_data_change = True
+        try:
+            self.parent.set_datacube(self.parent.datacube, self.parent.windowTitle())
+        finally:
+            self.keep_through_data_change = False
+        self.update_vis()
+        self.update_dps()
+        if self.merge_button.isChecked():
+            self._show_merged()

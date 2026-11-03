@@ -62,14 +62,25 @@ def mean_dp(data):
     return total / (R_Nx * R_Ny)
 
 
-def measure_bf_disk(data):
+def max_dp(data):
+    """The maximum diffraction pattern, read a block of scan rows at a time."""
+    R_Nx, R_Ny, Q_Nx, Q_Ny = data.shape
+    result = None
+    step = max(1, CHUNK_BYTES // (R_Ny * Q_Nx * Q_Ny * data.dtype.itemsize))
+    for rx in range(0, R_Nx, step):
+        block = np.max(data[rx : rx + step], axis=(0, 1))
+        result = block if result is None else np.maximum(result, block)
+    return result
+
+
+def measure_bf_disk(mean_pattern):
     """
     The bright-field disk's radius and centre, (radius, qx0, qy0) in pixels,
     measured from the mean diffraction pattern. Calls py4DSTEM's
     get_probe_size directly, as the DataCube method writes the result into
     the datacube's calibration.
     """
-    radius, qx0, qy0 = get_probe_size(mean_dp(data))
+    radius, qx0, qy0 = get_probe_size(mean_pattern)
     return float(radius), float(qx0), float(qy0)
 
 

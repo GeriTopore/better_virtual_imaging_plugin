@@ -83,14 +83,6 @@ def read_braggvectors(filepath: str, datapath: str):
     return py4DSTEM.read(filepath, datapath=datapath)
 
 
-def bvm(braggvectors) -> np.ndarray:
-    """
-    The Bragg vector map, from the vectors' raw (detector pixel) positions,
-    so it lines up with the diffraction patterns.
-    """
-    return np.asarray(braggvectors.histogram(mode="raw").data)
-
-
 def peaks_at(braggvectors, positions) -> np.ndarray:
     """
     The raw (qx, qy) of every Bragg peak detected at the given scan

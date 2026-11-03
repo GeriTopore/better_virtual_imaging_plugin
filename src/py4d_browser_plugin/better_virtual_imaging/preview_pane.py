@@ -4,14 +4,14 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore
 from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QCheckBox,
-    QDoubleSpinBox,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -33,6 +33,16 @@ CURSOR_HOVER_HANDLE_PEN = {"color": "c", "width": 9}
 APERTURE_PEN = {"color": "g", "width": 2}
 APERTURE_HOVER_PEN = {"color": "c", "width": 2}
 
+# Below this, previews don't shrink to fit the window, but scroll.
+PANE_MIN_HEIGHT = 380
+
+# The diffraction patterns a pane can show: (key, name in its menu).
+PATTERN_MODES = [
+    ("cursor", "Pattern at Cursor"),
+    ("mean", "Mean Pattern"),
+    ("max", "Maximum Pattern"),
+]
+
 
 def show_diffraction_image(view, image, scale_fn, relevel, first):
     # Transposed to match the main window's diffraction_space_widget
@@ -46,40 +56,6 @@ def show_diffraction_image(view, image, scale_fn, relevel, first):
         # Leave levels untouched, so any range the user set by hand on the
         # histogram survives the cursor moving.
         view.setImage(scaled, autoLevels=False, autoRange=False)
-
-
-class BVMPane(QGroupBox):
-    """The Bragg vector map of Bragg vectors saved with the dataset."""
-
-    def __init__(self, bvm, source):
-        super().__init__("Bragg Vector Map")
-
-        self.bvm = bvm
-
-        self.view = pg.ImageView()
-        self.view.ui.roiBtn.hide()
-        self.view.ui.menuBtn.hide()
-
-        # A long path can't wrap, so let it clip rather than widen the
-        # column, with the whole of it in the tooltip.
-        label = QLabel(source)
-        label.setToolTip(source)
-        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.view)
-        layout.addWidget(label)
-        self.setLayout(layout)
-
-    def set_colormap(self, diffraction_cmap):
-        self.view.setColorMap(diffraction_cmap)
-
-    def show_bvm(self, scale_fn, first=False):
-        # The map is mostly zeros and tiny values smeared out by its bilinear
-        # binning, which log scaling would stretch over the whole range --
-        # so floor it, for display, at a thousandth of its maximum.
-        floored = np.maximum(self.bvm, 1e-3 * self.bvm.max())
-        show_diffraction_image(self.view, floored, scale_fn, True, first)
 
 
 class PreviewPane(QGroupBox):
@@ -103,6 +79,8 @@ class PreviewPane(QGroupBox):
     sig_remove_requested = QtCore.pyqtSignal()
     # The g-vector array was switched on or off.
     sig_array_toggled = QtCore.pyqtSignal(bool)
+    # A different pattern was chosen to show (see pattern_mode).
+    sig_pattern_mode_changed = QtCore.pyqtSignal()
 
     def __init__(self, title):
         super().__init__(title)
@@ -115,6 +93,8 @@ class PreviewPane(QGroupBox):
         self.vimg = None  # the virtual image from the apertures, once there are any
         self.color = None  # RGB (0-1) chosen for the merged view, if any
         self.g_array = None  # a GVectorArray, once first switched on
+
+        self.setMinimumHeight(PANE_MIN_HEIGHT)
 
         self.dp_view = pg.ImageView()
         self.dp_view.setImage(np.zeros((512, 512)))
@@ -136,6 +116,17 @@ class PreviewPane(QGroupBox):
 
         self.dp_label = QLabel()
         self.vi_label = QLabel()
+
+        self.pattern_combo = QComboBox()
+        for key, name in PATTERN_MODES:
+            self.pattern_combo.addItem(name, key)
+        self.pattern_combo.setToolTip(
+            "Show the diffraction pattern at the cursor, or the mean or maximum "
+            "of every pattern in the scan"
+        )
+        self.pattern_combo.currentIndexChanged.connect(
+            lambda *_: self.sig_pattern_mode_changed.emit()
+        )
 
         self.clear_apertures_button = QPushButton("Clear Apertures")
         self.clear_apertures_button.clicked.connect(self.clear_apertures)
@@ -205,6 +196,7 @@ class PreviewPane(QGroupBox):
         self.remove_button.clicked.connect(self.sig_remove_requested.emit)
 
         header = QHBoxLayout()
+        header.addWidget(self.pattern_combo)
         header.addStretch()
         header.addWidget(self.array_button)
         header.addWidget(self.clear_apertures_button)
@@ -228,6 +220,10 @@ class PreviewPane(QGroupBox):
     def set_colormaps(self, realspace_cmap, diffraction_cmap):
         self.vi_view.setColorMap(realspace_cmap)
         self.dp_view.setColorMap(diffraction_cmap)
+
+    def pattern_mode(self):
+        """The pattern shown: "cursor", "mean" or "max" (see PATTERN_MODES)."""
+        return self.pattern_combo.currentData()
 
     def set_click_to_add(self, enabled):
         viewport = self.dp_view.ui.graphicsView.viewport()
