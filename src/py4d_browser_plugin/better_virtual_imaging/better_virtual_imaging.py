@@ -1,3 +1,5 @@
+import os
+import re
 from functools import partial
 
 import numpy as np
@@ -27,10 +29,11 @@ from PyQt5.QtWidgets import (
 
 from py4D_browser.utils import DetectorMode, DetectorShape
 
-from . import bragg, imaging, processing
+from . import bragg, figure, imaging, processing
 from .correction_dialog import PixelCorrectionDialog
 from .lattice import GVectorArray
 from .preview_pane import MergedPane, PreviewPane
+from .save_dialog import SaveFigureDialog
 
 from typing import TYPE_CHECKING
 
@@ -100,6 +103,8 @@ class BetterVirtualImagingWindow(QDialog):
         # values (not its shape), which it updates itself for, rather than
         # being rebuilt (see BetterVirtualImagingPlugin.on_datacube_changed).
         self.keep_through_data_change = False
+        # The folder images were last saved to, to offer again.
+        self.save_dir = None
 
         # The window is rebuilt for every new dataset, but the main window
         # redraws (and emits signal_diffraction_data_changed) for a new one
@@ -418,6 +423,7 @@ class BetterVirtualImagingWindow(QDialog):
         pane.sig_pattern_mode_changed.connect(
             partial(self.update_dps, panes=[pane], relevel=True)
         )
+        pane.sig_save_requested.connect(partial(self.on_save_image, pane))
         pane.set_snap_available(self.braggvectors is not None)
         pane.set_click_to_add(self.add_on_click_button.isChecked())
         self.panes.append(pane)
@@ -448,7 +454,7 @@ class BetterVirtualImagingWindow(QDialog):
 
         # Keep the previews numbered in order.
         for i, remaining in enumerate(self.panes):
-            remaining.setTitle(f"Preview {i + 1}")
+            remaining.set_default_title(f"Preview {i + 1}")
         self._layout_panes()
         self._update_pane_buttons()
 
@@ -771,6 +777,12 @@ class BetterVirtualImagingWindow(QDialog):
                 partial(self.update_dps, panes=[self.merged_pane])
             )
             self.merged_pane.sig_swatch_clicked.connect(self.on_swatch_clicked)
+            self.merged_pane.sig_pattern_mode_changed.connect(
+                partial(self.update_dps, panes=[self.merged_pane], relevel=True)
+            )
+            self.merged_pane.sig_save_requested.connect(
+                partial(self.on_save_image, self.merged_pane)
+            )
             self.sync_colormaps(panes=[self.merged_pane])
 
         # Start the cursor where the first merged preview's is.
@@ -861,6 +873,41 @@ class BetterVirtualImagingWindow(QDialog):
             pane.show()
         self._layout_panes()
         self._update_pane_buttons()
+
+    # --- Saving images ---
+
+    def _dataset_name(self):
+        # The loaded file's name (without extension) and folder, if known.
+        filepath = bragg.loaded_filepath(self.parent)
+        if filepath is None:
+            return "dataset", None
+        name = os.path.splitext(os.path.basename(filepath))[0]
+        return name, os.path.dirname(filepath)
+
+    def on_save_image(self, pane):
+        if pane.last_dp is None:
+            return
+        name, data_dir = self._dataset_name()
+        directory = self.save_dir or data_dir or os.path.expanduser("~")
+        if pane is self.merged_pane:
+            suffix = "merged"
+            vi_title = "Virtual Images: colour composite"
+        else:
+            # The user's name for the preview, made safe for a file name.
+            custom = pane.custom_name and re.sub(r"[^\w.-]+", "_", pane.custom_name)
+            suffix = custom.strip("_.") if custom else ""
+            suffix = suffix or f"preview_{self.panes.index(pane) + 1}"
+            vi_title = pane.vi_label.text()
+
+        fig = figure.pane_figure(
+            pane, f"{name}: {pane.title()}", pane.dp_label.text(), vi_title
+        )
+        dialog = SaveFigureDialog(
+            fig, os.path.join(directory, f"{name}_VI_{suffix}.png"), parent=self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self.save_dir = os.path.dirname(dialog.saved_path)
+            self.parent.statusBar().showMessage(f"Saved {dialog.saved_path}", 5_000)
 
     # --- Bragg vectors ---
 

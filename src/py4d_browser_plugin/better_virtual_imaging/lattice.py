@@ -7,7 +7,16 @@ ORIGIN_PEN = {"color": "w", "width": 2}
 G1_PEN = {"color": (255, 140, 0), "width": 2}
 G2_PEN = {"color": (0, 200, 255), "width": 2}
 HOVER_PEN = {"color": "c", "width": 2}
-RING_PEN = {"color": "y", "width": 2}
+RING_COLOR = (255, 255, 0)
+RING_PEN = {"color": RING_COLOR, "width": 3}
+
+# How opaque every aperture's fill is (0-1), here and in saved figures.
+APERTURE_FILL_ALPHA = 0.2
+
+
+def fill_brush(color):
+    """A translucent brush for filling an aperture, from an RGB (0-255) colour."""
+    return pg.mkBrush(*color, int(round(255 * APERTURE_FILL_ALPHA)))
 
 
 def _to_view(q):
@@ -176,7 +185,7 @@ class GVectorArray(QtCore.QObject):
                     "pos": _to_view(q),
                     "size": 2 * self.radius,
                     "pen": pg.mkPen(**RING_PEN),
-                    "brush": None,
+                    "brush": fill_brush(RING_COLOR),
                     "symbol": "o",
                 }
                 for q in self.positions()

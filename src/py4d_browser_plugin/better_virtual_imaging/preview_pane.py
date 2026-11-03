@@ -10,9 +10,12 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QStyleOptionGroupBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -20,7 +23,7 @@ from PyQt5.QtWidgets import (
 
 from py4D_browser.utils import DetectorShape, pg_point_roi
 
-from .lattice import G1_PEN, G2_PEN
+from .lattice import G1_PEN, G2_PEN, RING_COLOR, fill_brush
 
 # The main window's real-space selector pens (see update_realspace_detector
 # in update_views.py), so the cursors look the same here.
@@ -30,8 +33,9 @@ CURSOR_HOVER_PEN = {"color": "c", "width": 6}
 CURSOR_HOVER_HANDLE_PEN = {"color": "c", "width": 9}
 
 # Thinner than the main window's detector, as there can be many apertures.
-APERTURE_PEN = {"color": "g", "width": 2}
-APERTURE_HOVER_PEN = {"color": "c", "width": 2}
+APERTURE_COLOR = (0, 255, 0)
+APERTURE_PEN = {"color": APERTURE_COLOR, "width": 3}
+APERTURE_HOVER_PEN = {"color": "c", "width": 3}
 
 # Below this, previews don't shrink to fit the window, but scroll.
 PANE_MIN_HEIGHT = 380
@@ -58,6 +62,19 @@ def show_diffraction_image(view, image, scale_fn, relevel, first):
         view.setImage(scaled, autoLevels=False, autoRange=False)
 
 
+class ApertureROI(pg.CircleROI):
+    """A circular aperture, filled translucently in its outline's colour."""
+
+    def __init__(self, *args, color, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.brush = fill_brush(color)
+
+    def paint(self, p, opt, widget):
+        # CircleROI draws only the outline, with whatever brush is set.
+        p.setBrush(self.brush)
+        super().paint(p, opt, widget)
+
+
 class PreviewPane(QGroupBox):
     """
     One diffraction pattern and virtual image pair, laid out like the main
@@ -81,9 +98,17 @@ class PreviewPane(QGroupBox):
     sig_array_toggled = QtCore.pyqtSignal(bool)
     # A different pattern was chosen to show (see pattern_mode).
     sig_pattern_mode_changed = QtCore.pyqtSignal()
+    # The pane's save button was clicked.
+    sig_save_requested = QtCore.pyqtSignal()
 
     def __init__(self, title):
         super().__init__(title)
+
+        # The title is the user's name for the pane, if they've given one,
+        # or else the default the window numbers it with.
+        self.default_title = title
+        self.custom_name = None
+        self.renamable = True
 
         self.apertures = []  # pg.CircleROIs, in the order they were added
         self.rs_selector = None
@@ -189,6 +214,19 @@ class PreviewPane(QGroupBox):
         self.array_controls.setLayout(array_layout)
         self.array_controls.hide()
 
+        self.save_button = QPushButton("Save Image")
+        self.save_button.setToolTip(
+            "Save a figure of the diffraction pattern with its apertures, and "
+            "the virtual image they make"
+        )
+        self.save_button.clicked.connect(self.sig_save_requested.emit)
+
+        self.rename_button = QToolButton()
+        self.rename_button.setText("\u270e")
+        self.rename_button.setAutoRaise(True)
+        self.rename_button.setToolTip("Rename this preview (or double-click its name)")
+        self.rename_button.clicked.connect(self.rename)
+
         self.remove_button = QToolButton()
         self.remove_button.setText("\u2715")
         self.remove_button.setAutoRaise(True)
@@ -200,6 +238,8 @@ class PreviewPane(QGroupBox):
         header.addStretch()
         header.addWidget(self.array_button)
         header.addWidget(self.clear_apertures_button)
+        header.addWidget(self.save_button)
+        header.addWidget(self.rename_button)
         header.addWidget(self.remove_button)
 
         self.views_layout = QGridLayout()
@@ -216,6 +256,37 @@ class PreviewPane(QGroupBox):
         layout.addWidget(self.array_controls)
         layout.addLayout(self.views_layout)
         self.setLayout(layout)
+
+    # --- Name ---
+
+    def set_default_title(self, title):
+        # Shown unless the user has named the pane.
+        self.default_title = title
+        self.setTitle(self.custom_name or title)
+
+    def rename(self):
+        name, ok = QInputDialog.getText(
+            self,
+            "Rename Preview",
+            "Name (leave empty for the default):",
+            text=self.title(),
+        )
+        if not ok:
+            return
+        self.custom_name = name.strip() or None
+        self.setTitle(self.custom_name or self.default_title)
+
+    def mouseDoubleClickEvent(self, event):
+        # A double-click on the title renames the pane.
+        option = QStyleOptionGroupBox()
+        self.initStyleOption(option)
+        label = self.style().subControlRect(
+            QStyle.CC_GroupBox, option, QStyle.SC_GroupBoxLabel, self
+        )
+        if self.renamable and label.contains(event.pos()):
+            self.rename()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def set_colormaps(self, realspace_cmap, diffraction_cmap):
         self.vi_view.setColorMap(realspace_cmap)
@@ -280,9 +351,10 @@ class PreviewPane(QGroupBox):
     def add_aperture(self, qx, qy, radius):
         # The inverse of _aperture_geometry: centred on data pixel (qx, qy),
         # which is displayed at (qy + 0.5, qx + 0.5).
-        roi = pg.CircleROI(
+        roi = ApertureROI(
             (qy + 0.5 - radius, qx + 0.5 - radius),
             (2 * radius, 2 * radius),
+            color=APERTURE_COLOR,
             pen=APERTURE_PEN,
             hoverPen=APERTURE_HOVER_PEN,
             removable=True,  # right-click > Remove ROI
@@ -380,6 +452,23 @@ class PreviewPane(QGroupBox):
         if self.array_enabled():
             geometries += self.g_array.apertures()
         return geometries
+
+    def aperture_drawings(self):
+        """
+        Each aperture as ((qx, qy), radius, rgb), in the colour it's drawn
+        here as RGB (0-1): click-added ones green, the array's yellow.
+        """
+        click_rgb = tuple(c / 255 for c in APERTURE_COLOR)
+        array_rgb = tuple(c / 255 for c in RING_COLOR)
+        drawings = [
+            (*self._aperture_geometry(roi), click_rgb) for roi in self.apertures
+        ]
+        if self.array_enabled():
+            drawings += [
+                (centre, radius, array_rgb)
+                for centre, radius in self.g_array.apertures()
+            ]
+        return drawings
 
     # --- Virtual image and real-space cursor ---
 
@@ -485,6 +574,8 @@ class MergedPane(PreviewPane):
     def __init__(self):
         super().__init__("Merged Views")
 
+        self.renamable = False
+        self.rename_button.hide()
         self.clear_apertures_button.hide()
         self.remove_button.hide()
         self.array_button.hide()
@@ -502,12 +593,18 @@ class MergedPane(PreviewPane):
         self.markers = pg.ScatterPlotItem(pxMode=False)  # sizes in data pixels
         self.dp_view.getView().addItem(self.markers)
 
+        # What's shown, for saving (see aperture_drawings).
+        self.drawings = []
+        self.composite = None
+        self.legend_entries = []
+
     def set_colormaps(self, realspace_cmap, diffraction_cmap):
         # The composite has colours of its own.
         self.dp_view.setColorMap(diffraction_cmap)
 
     def show_composite(self, rgb):
         # Transposed like show_vi, keeping the colour axis last.
+        self.composite = rgb
         shown = np.transpose(rgb, (1, 0, 2))
         self.vi_view.setImage(
             shown,
@@ -516,23 +613,32 @@ class MergedPane(PreviewPane):
         )
 
     def set_aperture_markers(self, apertures):
-        """Draw apertures, each ((qx, qy), radius, rgb), as rings in their colour."""
+        """Draw apertures, each ((qx, qy), radius, rgb), in their colour."""
+        self.drawings = list(apertures)
+
+        def rgb255(rgb):
+            return [int(round(255 * c)) for c in rgb]
+
         # Centred where PreviewPane.add_aperture would draw them.
         self.markers.setData(
             [
                 {
                     "pos": (qy + 0.5, qx + 0.5),
                     "size": 2 * radius,
-                    "pen": pg.mkPen([int(round(255 * c)) for c in rgb], width=2),
-                    "brush": None,
+                    "pen": pg.mkPen(rgb255(rgb), width=APERTURE_PEN["width"]),
+                    "brush": fill_brush(rgb255(rgb)),
                     "symbol": "o",
                 }
                 for (qx, qy), radius, rgb in apertures
             ]
         )
 
+    def aperture_drawings(self):
+        return self.drawings
+
     def set_legend(self, entries):
         """Show a swatch and name for each entry, (name, rgb)."""
+        self.legend_entries = list(entries)
         while self.legend_layout.count():
             item = self.legend_layout.takeAt(0)
             if item.widget() is not None:
