@@ -102,6 +102,8 @@ class PreviewPane(QGroupBox):
     sig_pattern_mode_changed = QtCore.pyqtSignal()
     # The pane's save button was clicked.
     sig_save_requested = QtCore.pyqtSignal()
+    # The pane's save mask button was clicked.
+    sig_save_mask_requested = QtCore.pyqtSignal()
 
     def __init__(self, title):
         super().__init__(title)
@@ -224,6 +226,16 @@ class PreviewPane(QGroupBox):
         )
         self.save_button.clicked.connect(self.sig_save_requested.emit)
 
+        self.save_mask_button = QPushButton("Save Mask")
+        self.save_mask_button.setToolTip(
+            "Save the virtual image as a mask, of the scan positions above an "
+            "intensity threshold"
+        )
+        self.save_mask_button.clicked.connect(self.sig_save_mask_requested.emit)
+        # The threshold and inversion last saved with, to start from again.
+        self.mask_threshold = None
+        self.mask_invert = False
+
         self.rename_button = QToolButton()
         self.rename_button.setText("\u270e")
         self.rename_button.setAutoRaise(True)
@@ -243,6 +255,7 @@ class PreviewPane(QGroupBox):
         header.addWidget(self.array_button)
         header.addWidget(self.clear_apertures_button)
         header.addWidget(self.save_button)
+        header.addWidget(self.save_mask_button)
         header.addWidget(self.rename_button)
         header.addWidget(self.remove_button)
 
@@ -590,6 +603,8 @@ class MergedPane(PreviewPane):
 
         self.renamable = False
         self.rename_button.hide()
+        # A colour composite has no one intensity to threshold.
+        self.save_mask_button.hide()
         self.clear_apertures_button.hide()
         self.remove_button.hide()
         self.array_button.hide()

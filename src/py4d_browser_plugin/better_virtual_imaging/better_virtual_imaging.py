@@ -35,6 +35,7 @@ from . import bragg, figure, imaging, processing
 from .correction_dialog import PixelCorrectionDialog
 from .lattice import GVectorArray
 from .preview_pane import PANE_MIN_HEIGHT, MergedPane, PreviewPane
+from .mask_dialog import MaskDialog
 from .save_dialog import SaveFigureDialog
 from .wheel import ZOOM_KEY, WheelRouter
 
@@ -467,6 +468,7 @@ class BetterVirtualImagingWindow(QDialog):
             partial(self.update_dps, panes=[pane], relevel=True)
         )
         pane.sig_save_requested.connect(partial(self.on_save_image, pane))
+        pane.sig_save_mask_requested.connect(partial(self.on_save_mask, pane))
         pane.set_snap_available(self.braggvectors is not None)
         pane.set_click_to_add(self.add_on_click_button.isChecked())
         self.panes.append(pane)
@@ -1020,10 +1022,7 @@ class BetterVirtualImagingWindow(QDialog):
             suffix = "merged"
             vi_title = "Virtual Images: colour composite"
         else:
-            # The user's name for the preview, made safe for a file name.
-            custom = pane.custom_name and re.sub(r"[^\w.-]+", "_", pane.custom_name)
-            suffix = custom.strip("_.") if custom else ""
-            suffix = suffix or f"preview_{self.panes.index(pane) + 1}"
+            suffix = self._file_suffix(pane)
             vi_title = pane.vi_label.text()
 
         fig = figure.pane_figure(
@@ -1033,6 +1032,34 @@ class BetterVirtualImagingWindow(QDialog):
             fig, os.path.join(directory, f"{name}_VI_{suffix}.png"), parent=self
         )
         if dialog.exec_() == QDialog.Accepted:
+            self.save_dir = os.path.dirname(dialog.saved_path)
+            self.parent.statusBar().showMessage(f"Saved {dialog.saved_path}", 5_000)
+
+    def _file_suffix(self, pane):
+        # The user's name for the preview, made safe for a file name, or
+        # else its number.
+        custom = pane.custom_name and re.sub(r"[^\w.-]+", "_", pane.custom_name)
+        suffix = custom.strip("_.") if custom else ""
+        return suffix or f"preview_{self.panes.index(pane) + 1}"
+
+    def on_save_mask(self, pane):
+        # The virtual image as shown -- the preview's own, or the main
+        # window's if it has no apertures -- transposed back.
+        image = pane.vi_view.image
+        if image is None or image.ndim != 2 or not self._has_data():
+            return
+        name, data_dir = self._dataset_name()
+        directory = self.save_dir or data_dir or os.path.expanduser("~")
+        dialog = MaskDialog(
+            image.T,
+            pane.vi_view.ui.histogram.gradient.colorMap(),
+            os.path.join(directory, f"{name}_VI_mask_{self._file_suffix(pane)}.npy"),
+            threshold=pane.mask_threshold,
+            invert=pane.mask_invert,
+            parent=self,
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            pane.mask_threshold, pane.mask_invert = dialog.threshold(), dialog.invert()
             self.save_dir = os.path.dirname(dialog.saved_path)
             self.parent.statusBar().showMessage(f"Saved {dialog.saved_path}", 5_000)
 
