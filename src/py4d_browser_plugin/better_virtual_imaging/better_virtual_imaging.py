@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -32,13 +34,17 @@ from py4D_browser.utils import DetectorMode, DetectorShape
 from . import bragg, figure, imaging, processing
 from .correction_dialog import PixelCorrectionDialog
 from .lattice import GVectorArray
-from .preview_pane import MergedPane, PreviewPane
+from .preview_pane import PANE_MIN_HEIGHT, MergedPane, PreviewPane
 from .save_dialog import SaveFigureDialog
+from .wheel import ZOOM_KEY, WheelRouter
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from py4D_browser import DataViewer
+
+# The most previews the merged view's list shows before scrolling.
+MERGE_LIST_ROWS = 8
 
 
 class BetterVirtualImagingPlugin(QWidget):
@@ -123,6 +129,7 @@ class BetterVirtualImagingWindow(QDialog):
 
         self.setWindowTitle("Better Virtual Imaging")
 
+        self.merge_box = self._build_merge_box()
         apertures_box = self._build_apertures_box()
         scaling_box = self._build_scaling_box()
         binning_box = self._build_binning_box()
@@ -132,6 +139,7 @@ class BetterVirtualImagingWindow(QDialog):
         self.add_pane_button.clicked.connect(self.add_pane)
 
         controls_layout = QVBoxLayout()
+        controls_layout.addWidget(self.merge_box)
         controls_layout.addWidget(apertures_box)
         controls_layout.addWidget(scaling_box)
         controls_layout.addWidget(binning_box)
@@ -156,7 +164,12 @@ class BetterVirtualImagingWindow(QDialog):
         # Toggles between the separate previews and a merged view of them
         # (built on first use, then hidden rather than deleted).
         self.merged_pane = None
-        self.merged = []  # the previews in the merged view, in order
+        # The previews that can be merged (those with apertures), and those
+        # of them in the merged view (those ticked in merge_list), in order.
+        self.mergeable = []
+        self.merged = []
+        # Every preview's height (see fit_pane_heights).
+        self.pane_height = PANE_MIN_HEIGHT
         self.merge_button = QPushButton("Merge Views")
         self.merge_button.setCheckable(True)
         self.merge_button.setToolTip(
@@ -165,21 +178,35 @@ class BetterVirtualImagingWindow(QDialog):
         )
         self.merge_button.toggled.connect(self.on_merge_toggled)
 
-        # The previews, one per row, sharing the height until they'd be
-        # squeezed below PANE_MIN_HEIGHT, then scrolling.
+        # The previews, one per row, each a fixed height (see
+        # fit_pane_heights), scrolling when there are more than fit -- and
+        # kept to the top by the stretch, always last, when there are fewer.
         self.previews_layout = QVBoxLayout()
         self.previews_layout.setContentsMargins(0, 0, 0, 0)
+        self.previews_layout.addStretch()
         self.views = QWidget()
         self.views.setLayout(self.previews_layout)
         self.previews_scroll = QScrollArea()
         self.previews_scroll.setWidgetResizable(True)
         self.previews_scroll.setWidget(self.views)
         self.previews_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        # Always on, so the previews' width (and so their height) doesn't
+        # change with whether they scroll.
+        self.previews_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.previews_scroll.viewport().installEventFilter(self)
+        # The wheel scrolls the previews even over their images, zooming
+        # those only with Cmd/Ctrl held (see wheel.py).
+        self.wheel_router = WheelRouter(self.previews_scroll, parent=self)
+        wheel_hint = QLabel(
+            f"Scroll to move through the previews, {ZOOM_KEY} + scroll to zoom"
+        )
+        wheel_hint.setEnabled(False)  # greyed, as a hint
 
         previews_header = QHBoxLayout()
         previews_header.addWidget(self.add_pane_button)
         previews_header.addWidget(self.merge_button)
         previews_header.addStretch()
+        previews_header.addWidget(wheel_hint)
         previews_layout = QVBoxLayout()
         previews_layout.setContentsMargins(0, 0, 0, 0)
         previews_layout.addLayout(previews_header)
@@ -348,6 +375,22 @@ class BetterVirtualImagingWindow(QDialog):
             f"Scan {R_Nx} \u00d7 {R_Ny}, patterns {Q_Nx} \u00d7 {Q_Ny}"
         )
 
+    def _build_merge_box(self):
+        # Shown only while the views are merged (see _fill_merge_list).
+        box = QGroupBox("Merged Previews")
+        self.merge_list = QListWidget()
+        self.merge_list.setToolTip(
+            "Untick a preview to leave it out of the merged view (previews "
+            "without apertures can't be merged)"
+        )
+        self.merge_list.itemChanged.connect(self.on_merge_list_changed)
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Show in the merged view:"))
+        layout.addWidget(self.merge_list)
+        box.setLayout(layout)
+        box.hide()
+        return box
+
     def _build_bad_pixels_box(self):
         box = QGroupBox("Bad Pixels")
 
@@ -429,6 +472,7 @@ class BetterVirtualImagingWindow(QDialog):
         self.panes.append(pane)
         self._layout_panes()
         self.disable_auto_default(pane)
+        self.wheel_router.add_pane(pane)
         self.sync_colormaps(panes=[pane])
 
         self._place_cursor_from_main(pane)
@@ -436,10 +480,13 @@ class BetterVirtualImagingWindow(QDialog):
         self.update_dps(panes=[pane])
 
         self._update_pane_buttons()
-        # Once it's laid out, scroll to it if it's below the others.
-        QtCore.QTimer.singleShot(
-            0, lambda: self.previews_scroll.ensureWidgetVisible(pane)
-        )
+        # Once it's laid out, size it, and scroll to it if it's below the
+        # others.
+        QtCore.QTimer.singleShot(0, lambda: self._fit_and_show(pane))
+
+    def _fit_and_show(self, pane):
+        self.fit_pane_heights()
+        self.previews_scroll.ensureWidgetVisible(pane)
 
     def add_pane(self):
         self._append_pane()
@@ -448,6 +495,7 @@ class BetterVirtualImagingWindow(QDialog):
         if len(self.panes) <= 1:
             return
         self.panes.remove(pane)
+        self.wheel_router.remove_pane(pane)
         self.previews_layout.removeWidget(pane)
         pane.hide()
         pane.deleteLater()
@@ -469,7 +517,37 @@ class BetterVirtualImagingWindow(QDialog):
         for pane in self.panes:
             self.previews_layout.removeWidget(pane)
         for pane in self.panes:
-            self.previews_layout.addWidget(pane)
+            self._add_to_previews(pane)
+
+    def _add_to_previews(self, pane):
+        # Below the others, above the stretch.
+        pane.setFixedHeight(self.pane_height)
+        self.previews_layout.insertWidget(self.previews_layout.count() - 1, pane)
+
+    def fit_pane_heights(self):
+        """
+        Make every preview as tall as the space they're shown in, as one
+        alone would be -- but no taller than makes its images square, beyond
+        which they'd only gain space around them, nor shorter than
+        PANE_MIN_HEIGHT. More than fit scroll.
+        """
+        height = self.previews_scroll.viewport().height()
+        shown = [pane for pane in self._cursor_panes() if pane.isVisible()]
+        image_heights = [pane.height_for_images() for pane in shown]
+        image_heights = [h for h in image_heights if h is not None]
+        if image_heights:
+            height = min(height, max(image_heights))
+        self.pane_height = max(height, PANE_MIN_HEIGHT)
+        for pane in self._cursor_panes():
+            pane.setFixedHeight(self.pane_height)
+
+    def eventFilter(self, obj, event):
+        if (
+            obj is self.previews_scroll.viewport()
+            and event.type() == QtCore.QEvent.Resize
+        ):
+            self.fit_pane_heights()
+        return super().eventFilter(obj, event)
 
     def _cursor_panes(self):
         # Every pane with a diffraction pattern and real-space cursor: the
@@ -764,8 +842,8 @@ class BetterVirtualImagingWindow(QDialog):
     def _merge_views(self):
         # Only previews with apertures have a virtual image of their own to
         # merge; the rest show the main window's.
-        merged = [pane for pane in self.panes if pane.vimg is not None]
-        if not merged or not self._has_data():
+        mergeable = [pane for pane in self.panes if pane.vimg is not None]
+        if not mergeable or not self._has_data():
             self.parent.statusBar().showMessage(
                 "Add apertures to a preview to merge its view", 5_000
             )
@@ -784,10 +862,11 @@ class BetterVirtualImagingWindow(QDialog):
                 partial(self.on_save_image, self.merged_pane)
             )
             self.sync_colormaps(panes=[self.merged_pane])
+            self.wheel_router.add_pane(self.merged_pane)
 
         # Start the cursor where the first merged preview's is.
         Rshape = self.data_shape[:2]
-        source = merged[0]
+        source = mergeable[0]
         xc, yc = source.scan_centre(Rshape)
         if source.rs_shape is DetectorShape.POINT:
             self.merged_pane.set_point_selector(xc, yc)
@@ -795,32 +874,78 @@ class BetterVirtualImagingWindow(QDialog):
             like = source.get_scan_selection(Rshape)
             self.merged_pane.set_rect_selector(*self._rect_around(xc, yc, like=like))
 
-        self.merged = merged
+        self.mergeable = mergeable
+        self.merged = [pane for pane in mergeable if pane.in_merge]
+        self._fill_merge_list()
+        self.merge_box.show()
         self._show_merged()
 
         for pane in self.panes:
             self.previews_layout.removeWidget(pane)
             pane.hide()
-        self.previews_layout.addWidget(self.merged_pane)
+        self._add_to_previews(self.merged_pane)
         self.merged_pane.show()
+        QtCore.QTimer.singleShot(0, self.fit_pane_heights)
         self.update_dps(panes=[self.merged_pane])
 
         self._update_pane_buttons()
         return True
 
+    def _fill_merge_list(self):
+        # Every preview, ticked if it's in the merged view; those without
+        # apertures greyed out.
+        self.merge_list.blockSignals(True)
+        self.merge_list.clear()
+        for i, pane in enumerate(self.panes):
+            item = QListWidgetItem(pane.title())
+            item.setData(QtCore.Qt.UserRole, i)
+            if pane in self.mergeable:
+                item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+                checked = pane in self.merged
+                item.setCheckState(
+                    QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+                )
+            else:
+                item.setText(f"{pane.title()} (no apertures)")
+                item.setFlags(QtCore.Qt.NoItemFlags)
+                item.setCheckState(QtCore.Qt.Unchecked)
+            self.merge_list.addItem(item)
+        self.merge_list.blockSignals(False)
+        # Only as tall as its rows, up to MERGE_LIST_ROWS of them.
+        rows = min(max(self.merge_list.count(), 1), MERGE_LIST_ROWS)
+        self.merge_list.setFixedHeight(
+            rows * self.merge_list.sizeHintForRow(0) + 2 * self.merge_list.frameWidth()
+        )
+
+    def on_merge_list_changed(self, item):
+        pane = self.panes[item.data(QtCore.Qt.UserRole)]
+        pane.in_merge = item.checkState() == QtCore.Qt.Checked
+        self.merged = [pane for pane in self.mergeable if pane.in_merge]
+        self._show_merged()
+
     def _merged_colors(self):
-        # Each merged preview's chosen colour, or else its default.
-        defaults = imaging.composite_colors(len(self.merged))
+        # Each merged preview's chosen colour, or else its default -- the
+        # defaults spread over every preview that can be merged, so each
+        # keeps its colour whichever others are ticked.
+        defaults = imaging.composite_colors(len(self.mergeable))
         return [
-            pane.color if pane.color is not None else default
-            for pane, default in zip(self.merged, defaults)
+            (
+                pane.color
+                if pane.color is not None
+                else defaults[self.mergeable.index(pane)]
+            )
+            for pane in self.merged
         ]
 
     def _show_merged(self):
         colors = self._merged_colors()
-        self.merged_pane.show_composite(
-            imaging.color_composite([pane.vimg for pane in self.merged], colors)
-        )
+        if self.merged:
+            composite = imaging.color_composite(
+                [pane.vimg for pane in self.merged], colors
+            )
+        else:
+            composite = np.zeros(tuple(self.data_shape[:2]) + (3,))
+        self.merged_pane.show_composite(composite)
         self.merged_pane.set_aperture_markers(
             [
                 (centre, radius, color)
@@ -867,12 +992,14 @@ class BetterVirtualImagingWindow(QDialog):
         dialog.move(x, y)
 
     def _separate_views(self):
+        self.merge_box.hide()
         self.previews_layout.removeWidget(self.merged_pane)
         self.merged_pane.hide()
         for pane in self.panes:
             pane.show()
         self._layout_panes()
         self._update_pane_buttons()
+        QtCore.QTimer.singleShot(0, self.fit_pane_heights)
 
     # --- Saving images ---
 

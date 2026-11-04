@@ -37,8 +37,10 @@ APERTURE_COLOR = (0, 255, 0)
 APERTURE_PEN = {"color": APERTURE_COLOR, "width": 3}
 APERTURE_HOVER_PEN = {"color": "c", "width": 3}
 
-# Below this, previews don't shrink to fit the window, but scroll.
-PANE_MIN_HEIGHT = 380
+# Previews are each as tall as the space they're shown in (see
+# BetterVirtualImagingWindow.fit_pane_heights), but never shorter than
+# this: more of them scroll rather than shrink.
+PANE_MIN_HEIGHT = 560
 
 # The diffraction patterns a pane can show: (key, name in its menu).
 PATTERN_MODES = [
@@ -117,9 +119,10 @@ class PreviewPane(QGroupBox):
         self._has_shown_dp = False
         self.vimg = None  # the virtual image from the apertures, once there are any
         self.color = None  # RGB (0-1) chosen for the merged view, if any
+        self.in_merge = True  # ticked in the window's list of merged previews
         self.g_array = None  # a GVectorArray, once first switched on
 
-        self.setMinimumHeight(PANE_MIN_HEIGHT)
+        self.setFixedHeight(PANE_MIN_HEIGHT)
 
         self.dp_view = pg.ImageView()
         self.dp_view.setImage(np.zeros((512, 512)))
@@ -234,6 +237,7 @@ class PreviewPane(QGroupBox):
         self.remove_button.clicked.connect(self.sig_remove_requested.emit)
 
         header = QHBoxLayout()
+        header.addWidget(QLabel("Current diffraction view:"))
         header.addWidget(self.pattern_combo)
         header.addStretch()
         header.addWidget(self.array_button)
@@ -295,6 +299,16 @@ class PreviewPane(QGroupBox):
     def pattern_mode(self):
         """The pattern shown: "cursor", "mean" or "max" (see PATTERN_MODES)."""
         return self.pattern_combo.currentData()
+
+    def height_for_images(self):
+        """
+        How tall the pane would be with its images square -- any taller only
+        adds space around them -- or None before it's laid out.
+        """
+        image_area = self.dp_view.ui.graphicsView
+        if not self.isVisible() or image_area.width() <= 0:
+            return None
+        return self.height() - image_area.height() + image_area.width()
 
     def set_click_to_add(self, enabled):
         viewport = self.dp_view.ui.graphicsView.viewport()
